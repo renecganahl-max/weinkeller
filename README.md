@@ -4,6 +4,18 @@ Eine Weinkeller-App fürs Handy. Etikett fotografieren, eine kostenlose KI liest
 Winzer, Rebsorte und Jahrgang, du bestätigst, fertig. Dazu Trinkfenster-Ampel,
 Sommelier, Erfolge, Rebsorten-Album und Konfetti.
 
+## Online
+
+Die App läuft unter **https://renecganahl-max.github.io/weinkeller/**.
+Am Handy öffnen und als App installieren:
+
+- iPhone: in Safari auf „Teilen“, dann „Zum Home-Bildschirm“.
+- Android: im Chrome-Menü „App installieren“.
+
+Änderungen gehen von selbst online, sobald sie auf GitHub im Branch `main` liegen
+(GitHub Pages, dauert ein bis zwei Minuten). Die Weine bleiben auf jedem Handy für sich;
+zum Umziehen gibt es unter „Mehr“ die Sicherung.
+
 ## Starten am Mac
 
 ```bash
