@@ -65,7 +65,16 @@ andere Gratis-Bildmodelle. Der Schlüssel bleibt nur auf dem Gerät.
 - Sommelier-Leiste auf der Startseite: Essen eintippen, Vorschlag kommt sofort.
 - Doppelte Weine erkennt sie und zählt einfach die Flaschen hoch.
 - Trinkfenster als Ampel: Lagern, Jetzt trinken, Bald trinken, Drüber. „Heute dran“ zeigt, was weg muss.
-- Flasche öffnen: Sterne und Verkostungsnotiz, mit Rückgängig.
+- Flasche öffnen: Sterne und Verkostungsnotiz, mit Rückgängig. „Ohne Notiz“ behält die Sterne.
+- Getrunken (Filter im Keller): jede geöffnete Flasche, nach Monaten, mit Sternen und Notiz. Die Suche
+  findet auch Notizen. „Bewerten“ trägt Sterne und Notiz nach, auch Tage später; Punkte gibt es pro
+  Öffnung nur einmal. Ganz oben die Lieblingsweine (ab 4 Sternen im Schnitt), im Keller mit ♥ markiert.
+  Ist ein Lieblingswein leer, zeigt die Detail-Ansicht „Wo gibt’s ihn?“ und „+ 1 nachgekauft“.
+- Daten sicher: Auf dem iPhone in Safari erklärt eine Karte, wie die App auf den Home-Bildschirm kommt
+  (Safari kann Daten nach 7 Tagen ohne Besuch löschen, die Home-Bildschirm-App nicht, und beide haben
+  getrennten Speicher). Auf Android gibt es dort den Knopf „Installieren“. Später erinnert eine kleine
+  Karte an die Sicherung: ab 5 Weinen oder nach einer Woche, danach alle 30 Tage, wenn sich etwas
+  geändert hat. Jeder Hinweis lässt sich wegtippen.
 - Sommelier: Essen eingeben, die KI wählt aus dem eigenen Keller (ohne KI nach Regeln).
 - Links zu Vivino (Bewertungen) und Wine-Searcher (Preise).
 - Spiel: XP, 10 Level, 15 Erfolge, Rebsorten-Album, Länder. Punkte gibt es fürs Sammeln,
@@ -90,6 +99,6 @@ Kein Build-Schritt, keine Pakete. Jede Datei lässt sich direkt bearbeiten.
 
 ## Nächste Schritte
 
-- Online stellen (HTTPS), damit sie als App auf beide Handys kommt.
 - Gemeinsamer Keller mit Login (zum Beispiel Supabase); dafür wird nur `js/db.js` ausgetauscht.
+  Damit wäre auch die Sicherung automatisch.
 - KI-Schlüssel auf einen kleinen Server legen (Cloudflare-Funktion), damit niemand einen eigenen braucht.

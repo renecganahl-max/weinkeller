@@ -24,7 +24,7 @@ const TABS = [
 const filters = () => [
   { id: 'alle', label: 'Alle' }, { id: 'trinkreif', label: '🍷 Trinkreif' },
   ...typeKeys(!!settings().moreTypes).map(k => ({ id: k, label: COLORS[k].label })),
-  { id: 'leer', label: 'Ausgetrunken' },
+  { id: 'getrunken', label: '🥂 Getrunken' },
 ];
 const VIEWS = ['list', 'grid', 'places'];
 const SORTS = [
@@ -61,6 +61,7 @@ const state = {
   highlight: null,
   draft: null,
   drink: null,
+  rate: null,
   somm: null,
   sommFood: '',
   keyStatus: null,
@@ -76,6 +77,28 @@ const byId = id => state.wines.find(w => w.id === id);
 const inStock = () => state.wines.filter(w => w.qty > 0);
 const saveGame = () => db.setMeta('game', state.game).catch(() => {});
 const wineTitle = w => w.producer || w.name || w.grape || 'Unbekannter Wein';
+const DAY = 864e5;
+const lsGet = k => { try { return localStorage.getItem(k); } catch (_) { return null; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, String(v)); } catch (_) { /* ignore */ } };
+
+/* ---------- ratings and favourite wines ---------- */
+// Average stars per wine from its openings; 4 stars or more on average makes a favourite.
+function ratingMap() {
+  const m = new Map();
+  for (const e of state.events) {
+    if (!(e.rating > 0)) continue;
+    const r = m.get(e.wineId) || { sum: 0, n: 0 };
+    r.sum += e.rating;
+    r.n++;
+    m.set(e.wineId, r);
+  }
+  return m;
+}
+const avgOf = (m, id) => { const r = m.get(id); return r ? r.sum / r.n : 0; };
+const favSet = (m = ratingMap()) => new Set([...m.keys()].filter(id => avgOf(m, id) >= 4));
+const isFav = id => avgOf(ratingMap(), id) >= 4;
+const fmtAvg = n => n.toLocaleString('de-AT', { maximumFractionDigits: 1 });
+const starsText = n => '★'.repeat(n) + '☆'.repeat(5 - n);
 
 /* ---------- storage places ("Lager") ---------- */
 const placeById = id => (id && state.places.find(p => p.id === id)) || null;
@@ -153,7 +176,7 @@ function celebrate(kind = 'small') {
   }
 }
 
-const THUMB_SIZE = { thumb: 66, 'mini-img': 62, 'dup-img': 40 };
+const THUMB_SIZE = { thumb: 66, 'mini-img': 62, 'dup-img': 40, 'jr-img': 46 };
 function thumb(w, cls = 'thumb') {
   const p = safePhoto(w.photo);
   return p
@@ -414,7 +437,7 @@ function goTab(id, after) {
 /* ---------- Keller ---------- */
 function viewKeller() {
   const actions = `<button class="icon-btn" data-action="manual" aria-label="Wein ohne Foto eintragen">${icon('plus')}</button>${levelChip()}`;
-  if (!state.wines.length) return topbar('Weinkeller', greeting(), actions) + emptyState();
+  if (!state.wines.length) return topbar('Weinkeller', greeting(), actions) + safetyCard() + emptyState();
   const stock = inStock();
   const bottles = stock.reduce((a, w) => a + w.qty, 0);
   const ready = stock.filter(w => READY.includes(status(w))).reduce((a, w) => a + w.qty, 0);
@@ -427,6 +450,7 @@ function viewKeller() {
       <div class="stat">${num('ready', ready)}<span class="lbl">trinkreif</span></div>
     </div>
     ${typeBar(stock, bottles)}
+    ${safetyCard()}
     ${soon.length ? todayCard(soon) : ''}
     ${stock.length ? `<form class="somm-bar" id="somm-bar" autocomplete="off">
       <span class="somm-ico" aria-hidden="true">🤵</span>
@@ -463,6 +487,54 @@ function emptyState() {
     </div>
     ${aiReady() ? '' : `<div class="callout info" style="margin-top:16px;text-align:left">${icon('sparkles')}<span><b>Tipp:</b> Richte zuerst die Gratis-KI ein, dann füllt sich alles von selbst. <button class="link" data-action="goto-ai">So geht’s</button></span></div>`}
     <p class="small muted" style="margin:14px 0 0">Erst mal schauen? <button class="link" data-action="demo">Mit Beispielweinen ausprobieren</button></p>
+    <p class="small muted" style="margin:6px 0 0">Neues Handy oder vorher in Safari eingetragen? <button class="link" data-action="restore">Sicherung laden</button></p>
+  </section>`;
+}
+
+/* ---------- keeping the data safe ---------- */
+// iPads say "Macintosh" but have touch; Android never counts.
+const isIos = () => !/Android/i.test(navigator.userAgent)
+  && (/iPad|iPhone|iPod/.test(navigator.userAgent) || (/Mac/.test(navigator.platform) && navigator.maxTouchPoints > 1));
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const lastBackup = () => Number(lsGet('wk.lastBackup')) || 0;
+const daysAgo = ts => Math.max(0, Math.floor((Date.now() - ts) / DAY));
+
+// One small card at most. First the home screen (Safari may clear sites it has not seen for 7 days,
+// a home-screen app keeps its data), then a gentle backup reminder once there is something to lose.
+function safetyCard() {
+  const now = Date.now();
+  const real = state.wines.filter(w => !w.demo);
+  const hidden = key => now - (Number(lsGet(`wk.hide.${key}`)) || 0) < (key === 'install' ? 21 : 7) * DAY;
+  const x = key => `<button class="icon-btn flat safe-x" data-action="hide-safe" data-k="${key}" aria-label="Hinweis ausblenden">${icon('x')}</button>`;
+  const ios = isIos();
+  const androidReady = !!deferredPrompt && matchMedia('(pointer: coarse)').matches;
+  if (!isStandalone() && (ios || androidReady) && !hidden('install')) {
+    const how = ios
+      ? `„Teilen“ <span class="ios-share">${icon('share')}</span> tippen, dann „Zum Home-Bildschirm“. Dort bleiben deine Weine sicher.`
+      : 'Startet wie eine echte App, und deine Weine bleiben sicher.';
+    // Safari and the home-screen app keep separate data, so wines entered here need the backup to move over.
+    const carry = ios && real.length
+      ? `<small>Deine Weine von hier: <button class="link" data-action="backup">Sicherung speichern</button> und in der App laden.</small>`
+      : '';
+    return `<section class="safe-card" aria-label="Als App installieren">
+      <span class="safe-ico" aria-hidden="true">📲</span>
+      <div class="safe-text"><b>Als App auf den Home-Bildschirm</b><small>${how}</small>${carry}
+        ${androidReady && !ios ? '<div class="row-btns"><button class="btn primary small" data-action="install">Installieren</button></div>' : ''}</div>
+      ${x('install')}
+    </section>`;
+  }
+  if (!real.length || hidden('backup')) return '';
+  const last = lastBackup();
+  const changed = real.some(w => (w.updatedAt || w.createdAt || 0) > last) || state.events.some(e => e.date > last);
+  const first = Math.min(...real.map(w => w.createdAt || now));
+  const due = changed && (last ? now - last > 30 * DAY : real.length >= 5 || now - first > 7 * DAY);
+  if (!due) return '';
+  return `<section class="safe-card" aria-label="Sicherung">
+    <span class="safe-ico" aria-hidden="true">💾</span>
+    <div class="safe-text"><b>${last ? `Letzte Sicherung vor ${plural(daysAgo(last), 'Tag', 'Tagen')}` : 'Noch keine Sicherung'}</b>
+      <small>Speicher deinen Keller als Datei, etwa in iCloud oder Google Drive. Falls das Handy mal weg ist.</small>
+      <div class="row-btns"><button class="btn primary small" data-action="backup">${icon('download')} Jetzt sichern</button></div></div>
+    ${x('backup')}
   </section>`;
 }
 
@@ -496,7 +568,7 @@ function todayCard(soon) {
   </section>`;
 }
 
-function card(w, i = 0) {
+function card(w, i = 0, favs = null) {
   const st = status(w);
   const { title, kicker, sub } = nameParts(w);
   return `<button class="card${state.highlight === w.id ? ' flash' : ''}" data-open="${w.id}" style="animation-delay:${Math.min(i, 12) * 22}ms">
@@ -506,6 +578,7 @@ function card(w, i = 0) {
       <span class="producer">${esc(title)}</span>
       ${sub ? `<span class="line2">${esc(sub)}</span>` : ''}
       <span class="tags">
+        ${favs?.has(w.id) ? '<span class="pill fav" title="Lieblingswein">♥<span class="sr">Lieblingswein</span></span>' : ''}
         ${w.vintage ? `<span class="pill">${w.vintage}</span>` : ''}
         ${st !== 'offen' ? `<span class="pill st st-${st}">${STATUS[st].label}</span>` : (w.color ? `<span class="pill"><i class="cdot" style="background:${COLORS[w.color].dot}"></i>${COLORS[w.color].label}</span>` : '')}
       </span>
@@ -514,20 +587,29 @@ function card(w, i = 0) {
   </button>`;
 }
 
+// Everything the search looks at for one wine.
+function wineHay(w) {
+  const place = placeById(w.placeId);
+  return norm([w.producer, w.name, w.grape, w.vintage, w.region, w.country, w.location, w.notes, w.sweetness, place?.name, ...grapesOf(w)].join(' '));
+}
+
 function renderList() {
   const el = $('#list');
   if (!el) return;
   const words = norm(state.query).split(' ').filter(Boolean);
-  let list = state.wines.filter(w => (state.filter === 'leer' ? w.qty <= 0 : w.qty > 0));
+  const journal = state.filter === 'getrunken';
+  // In "Getrunken" the cellar views and the sort order do not apply.
+  $('.search-row')?.classList.toggle('in-journal', journal);
+  $('.chips')?.classList.toggle('in-journal', journal);
+  if (journal) {
+    el.className = 'journal';
+    el.innerHTML = journalHtml(words);
+    return;
+  }
+  let list = state.wines.filter(w => w.qty > 0);
   if (COLORS[state.filter]) list = list.filter(w => w.color === state.filter);
   if (state.filter === 'trinkreif') list = list.filter(w => READY.includes(status(w)));
-  if (words.length) {
-    list = list.filter(w => {
-      const place = placeById(w.placeId);
-      const hay = norm([w.producer, w.name, w.grape, w.vintage, w.region, w.country, w.location, w.notes, w.sweetness, place?.name, ...grapesOf(w)].join(' '));
-      return words.every(x => hay.includes(x));
-    });
-  }
+  if (words.length) list = list.filter(w => { const hay = wineHay(w); return words.every(x => hay.includes(x)); });
   list.sort(SORTERS[state.sort] || SORTERS.neu);
   if (state.view === 'places') {
     // In the storage view a search or filter makes the matching bottles light up.
@@ -537,12 +619,71 @@ function renderList() {
     return;
   }
   const grid = state.view === 'grid' && list.length;
+  const favs = favSet();
   el.className = grid ? 'shelf' : 'list';
   el.innerHTML = list.length
-    ? list.map(grid ? shelfCard : card).join('')
-    : `<div class="none">${words.length || state.filter !== 'alle' ? 'Nichts gefunden. 🔍' : 'Keine Flaschen im Keller.'}</div>`;
+    ? list.map((w, i) => (grid ? shelfCard(w, i, favs) : card(w, i, favs))).join('')
+    : `<div class="none">${words.length || state.filter !== 'alle' ? 'Nichts gefunden. 🔍' : 'Keine Flaschen im Keller. Was schon getrunken ist, steht unter „Getrunken“.'}</div>`;
   const hit = el.querySelector('.flash');
   if (hit) hit.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+
+/* ---------- Getrunken: every opened bottle, newest first, and the favourite wines ---------- */
+function dayLabel(ts) {
+  const d = new Date(ts);
+  const now = new Date();
+  const days = Math.round((new Date(now.getFullYear(), now.getMonth(), now.getDate()) - new Date(d.getFullYear(), d.getMonth(), d.getDate())) / DAY);
+  if (days === 0) return 'Heute';
+  if (days === 1) return 'Gestern';
+  return d.toLocaleDateString('de-AT', { weekday: 'short', day: 'numeric', month: 'short' });
+}
+
+function journalHtml(words) {
+  const ratings = ratingMap();
+  const hit = (w, note = '') => {
+    if (!words.length) return true;
+    const hay = `${wineHay(w)} ${norm(note)}`;
+    return words.every(x => hay.includes(x));
+  };
+  // Openings, plus wines set to 0 bottles by hand (they have no opening of their own).
+  const opened = new Set(state.events.map(e => e.wineId));
+  const entries = state.events.map(e => ({ e, w: byId(e.wineId), date: e.date }))
+    .concat(state.wines.filter(w => w.qty <= 0 && !opened.has(w.id)).map(w => ({ e: null, w, date: w.updatedAt || w.createdAt || 0 })))
+    .filter(x => x.w && hit(x.w, x.e?.note))
+    .sort((a, b) => b.date - a.date);
+  const favs = state.wines.filter(w => avgOf(ratings, w.id) >= 4 && hit(w))
+    .sort((a, b) => avgOf(ratings, b.id) - avgOf(ratings, a.id) || (b.updatedAt || 0) - (a.updatedAt || 0));
+  if (!entries.length) {
+    return words.length
+      ? '<div class="none">Nichts gefunden. 🔍</div>'
+      : `<section class="journal-empty"><div class="art">🥂</div><h3>Noch nichts getrunken</h3><p class="muted">Öffnest du eine Flasche, steht sie hier, mit Sternen und Notiz. Ab 4 Sternen wird sie ein Lieblingswein.</p></section>`;
+  }
+  const favStrip = favs.length ? `<section class="fav-strip" aria-label="Lieblingsweine">
+    <div class="fav-head"><b>♥ Lieblingsweine</b><small>ab 4 Sternen</small></div>
+    <div class="fav-row">${favs.slice(0, 12).map(w => `<button class="fav" data-open="${w.id}">${thumb(w, 'mini-img')}<b>${esc(wineTitle(w))}</b><span><i class="fav-stars">★ ${fmtAvg(avgOf(ratings, w.id))}</i> · ${w.qty > 0 ? `noch ${w.qty}` : 'leer'}</span></button>`).join('')}</div>
+  </section>` : '';
+  let month = '';
+  const rows = entries.map(({ e, w, date }, i) => {
+    const m = new Date(date).toLocaleDateString('de-AT', { month: 'long', year: 'numeric' });
+    const head = m !== month ? `<h3 class="jr-month">${esc(m)}</h3>` : '';
+    month = m;
+    const { title, kicker } = nameParts(w);
+    const fav = avgOf(ratings, w.id) >= 4;
+    const sub = [dayLabel(date), e ? (e.count > 1 ? `${e.count} Flaschen` : '') : 'ausgetrunken', w.vintage || ''].filter(Boolean).join(' · ');
+    const side = !e ? ''
+      : e.rating
+        ? `<button class="jr-stars" data-rate="${e.id}" aria-label="${e.rating} von 5 Sternen. Ändern">★ ${e.rating}</button>`
+        : `<button class="jr-rate" data-rate="${e.id}">Bewerten</button>`;
+    return `${head}<div class="jr" style="animation-delay:${Math.min(i, 12) * 22}ms">
+      <button class="jr-main" data-open="${w.id}">${thumb(w, 'jr-img')}<span class="jr-meta">
+        ${kicker ? `<span class="kicker">${esc(kicker)}</span>` : ''}
+        <span class="jr-title">${fav ? '<span class="jr-heart" aria-label="Lieblingswein">♥</span> ' : ''}${esc(title)}</span>
+        <span class="jr-sub">${esc(sub)}</span>
+        ${e?.note ? `<span class="jr-note">${esc(e.note)}</span>` : ''}
+      </span></button>${side}
+    </div>`;
+  }).join('');
+  return favStrip + rows;
 }
 
 // Storage view: one card per place with its rack or box.
@@ -567,7 +708,7 @@ function placesHtml(match) {
 }
 
 // Shelf view: big bottle or label photo per wine, two or three per row.
-function shelfCard(w, i = 0) {
+function shelfCard(w, i = 0, favs = null) {
   const st = status(w);
   const { title, kicker } = nameParts(w);
   const photo = safePhoto(w.photo);
@@ -575,6 +716,7 @@ function shelfCard(w, i = 0) {
     <span class="shelf-tile ${photo ? '' : tileClass(w)}">
       ${photo ? `<img src="${photo}" alt="" loading="lazy" decoding="async">` : bottleSvg(w, 122)}
       ${w.vintage && photo ? `<span class="shelf-vintage">${w.vintage}</span>` : ''}
+      ${favs?.has(w.id) ? '<span class="shelf-fav" title="Lieblingswein">♥<span class="sr">Lieblingswein</span></span>' : ''}
       <span class="shelf-qty">×${w.qty}</span>
       ${w.demo ? '<span class="shelf-demo">Beispiel</span>' : ''}
     </span>
@@ -1059,6 +1201,9 @@ function refreshDetail(id) {
 function detailHtml(w) {
   const st = status(w);
   const evs = state.events.filter(e => e.wineId === w.id).sort((a, b) => b.date - a.date);
+  const rated = evs.filter(e => e.rating > 0);
+  const avg = rated.length ? rated.reduce((a, e) => a + e.rating, 0) / rated.length : 0;
+  const fav = avg >= 4;
   const rows = [
     w.location && [placeById(w.placeId) ? '📝 Notiz zum Ort' : '📍 Lagerort', esc(w.location)],
     w.price != null && w.price !== '' && ['💶 Preis', fmtEuro(Number(w.price))],
@@ -1069,6 +1214,7 @@ function detailHtml(w) {
   ].filter(Boolean);
   const origin = w.region || w.country;
   const tags = [
+    fav ? '<span class="pill fav">♥ Lieblingswein</span>' : '',
     ...grapesOf(w).map(g => `<button class="pill pill-link" data-search="${esc(g)}" aria-label="Alle Weine mit ${esc(g)} zeigen">🍇 ${esc(g)}</button>`),
     origin ? `<button class="pill pill-link" data-search="${esc(origin)}" aria-label="Alle Weine aus ${esc(origin)} zeigen">${flagOf(w) || '📍'} ${esc(origin)}</button>` : '',
     w.color ? `<span class="pill"><i class="cdot" style="background:${COLORS[w.color].dot}"></i>${COLORS[w.color].label}</span>` : '',
@@ -1087,9 +1233,11 @@ function detailHtml(w) {
     ${tags ? `<div class="tags">${tags}</div>` : ''}
     <div class="stock-row">
       <div class="stock"><b>${w.qty}</b><span>${w.qty === 1 ? 'Flasche' : 'Flaschen'} im Keller</span></div>
-      <button class="btn ghost small" data-action="qty" data-id="${w.id}" data-d="1">${icon('plus')} 1 dazugekauft</button>
+      <button class="btn ${w.qty > 0 ? 'ghost' : 'primary'} small" data-action="qty" data-id="${w.id}" data-d="1">${icon('plus')} 1 ${w.qty > 0 ? 'dazugekauft' : 'nachgekauft'}</button>
     </div>
-    ${w.qty > 0 ? `<button class="btn primary block open-btn" data-action="open-bottle" data-id="${w.id}">🍷 Flasche öffnen</button>` : '<p class="muted center small" style="margin:4px 0 12px">Ausgetrunken. Mit „1 dazugekauft“ kommt er zurück in den Keller.</p>'}
+    ${w.qty > 0 ? `<button class="btn primary block open-btn" data-action="open-bottle" data-id="${w.id}">🍷 Flasche öffnen</button>`
+      : fav ? `<div class="callout fav-callout"><span aria-hidden="true">♥</span><span><b>Einer deiner Lieblingsweine.</b> Ausgetrunken. <a href="${esc(wineSearcherUrl(w))}" target="_blank" rel="noopener">Wo gibt’s ihn?</a></span></div>`
+        : '<p class="muted center small" style="margin:4px 0 12px">Ausgetrunken. Nachgekauft? Mit „+ 1“ kommt er zurück in den Keller.</p>'}
     ${whereCard(w)}
     ${w.drinkFrom || w.drinkTo
       ? `<div class="tw"><div class="tw-top"><b>Trinkfenster</b><span class="pill st st-${st}">${STATUS[st].label}</span></div>${windowBar(w)}</div>`
@@ -1102,7 +1250,7 @@ function detailHtml(w) {
     </div>
     <div class="kv">${rows.map(([k, v]) => `<div><span>${k}</span><span>${v}</span></div>`).join('')}</div>
     ${w.notes ? `<div class="note-box"><b>Notiz</b><p>${esc(w.notes)}</p></div>` : ''}
-    ${evs.length ? `<h3 class="section-title">Geöffnet <small>${evs.length}×</small></h3><div class="events">${evs.map(evHtml).join('')}</div>` : ''}
+    ${evs.length ? `<h3 class="section-title">Geöffnet <small>${evs.length}×${rated.length ? ` · Ø ★ ${fmtAvg(avg)}` : ''}</small></h3><div class="events">${evs.map(evHtml).join('')}</div>` : ''}
     <div class="row-btns end" style="margin-top:18px">
       <button class="btn ghost small" data-action="edit" data-id="${w.id}">${icon('edit')} Bearbeiten</button>
       <button class="btn ghost small danger" data-action="delete" data-id="${w.id}">${icon('trash')} Löschen</button>
@@ -1150,6 +1298,8 @@ function pourAnim(color) {
 
 // "Wo liegt er?": the place, the slot names and a small plan with this wine's bottles lit up.
 function whereCard(w) {
+  // An empty wine lies nowhere; its place is kept, so a rebought bottle goes back there.
+  if (w.qty <= 0) return '';
   const p = placeById(w.placeId);
   if (!p) {
     return state.places.length && w.qty > 0
@@ -1166,10 +1316,12 @@ function whereCard(w) {
   </div>`;
 }
 
+// One opening in the detail view; tapping it adds or changes stars and note.
 function evHtml(e) {
-  const stars = e.rating ? `<span class="ev-stars" aria-label="${e.rating} von 5 Sternen">${'★'.repeat(e.rating)}${'☆'.repeat(5 - e.rating)}</span>` : '';
+  const stars = e.rating ? `<span class="ev-stars" aria-label="${e.rating} von 5 Sternen">${starsText(e.rating)}</span>` : '';
   const count = e.count > 1 ? `<span>${e.count} Flaschen</span>` : '';
-  return `<div class="ev"><div class="ev-top"><span>${fmtDate(e.date)}</span>${count}${stars}${e.inWindow ? '<span class="pill st st-jetzt">im Trinkfenster</span>' : ''}</div>${e.note ? `<p>${esc(e.note)}</p>` : ''}</div>`;
+  const edit = `<span class="ev-edit">${e.rating || e.note ? 'Ändern' : 'Bewerten'}</span>`;
+  return `<button type="button" class="ev" data-rate="${e.id}" aria-label="Verkostung vom ${fmtDate(e.date)} ${e.rating || e.note ? 'ändern' : 'bewerten'}"><span class="ev-top"><span>${fmtDate(e.date)}</span>${count}${stars}${e.inWindow ? '<span class="pill st st-jetzt">im Trinkfenster</span>' : ''}${edit}</span>${e.note ? `<span class="ev-note">${esc(e.note)}</span>` : ''}</button>`;
 }
 
 // Bottles that leave the cellar free their slots; new bottles get the next free slots.
@@ -1225,14 +1377,16 @@ async function confirmDrink(skip) {
   const dr = state.drink;
   const w = dr && byId(dr.id);
   if (!w) return;
+  // "Ohne Notiz" skips the note only; stars that were tapped are kept.
   const note = skip ? '' : ($('#drink-note')?.value || '').trim();
-  const rating = skip ? 0 : dr.rating;
+  const rating = dr.rating;
   const before = { ...w, slots: [...(w.slots || [])] };
+  const wasFav = isFav(w.id);
   const count = Math.max(1, Math.min(w.qty, dr.count || 1));
   w.qty = Math.max(0, w.qty - count);
   w.updatedAt = Date.now();
   syncSlots(w);
-  const ev = { id: uid(), wineId: w.id, type: 'open', date: Date.now(), rating, note, inWindow: dr.inWindow, count };
+  const ev = { id: uid(), wineId: w.id, type: 'open', date: Date.now(), rating, note, inWindow: dr.inWindow, count, xpNote: !!note, xpRating: !!rating };
   state.events.push(ev);
   try { await Promise.all([db.put('wines', w), db.put('events', ev)]); } catch (_) { toast('Speichern hat nicht geklappt.'); }
   state.drink = null;
@@ -1248,7 +1402,50 @@ async function confirmDrink(skip) {
   const left = w.qty
     ? `${count > 1 ? `${count} geöffnet · ` : ''}Noch ${plural(w.qty, 'Flasche', 'Flaschen')} übrig`
     : (count > 1 ? `${count} geöffnet, das waren die letzten` : 'Das war die letzte Flasche');
-  toast(`${left}${res.total ? ` · +${res.total} XP` : ''}`, { action: 'Rückgängig', onAction: () => undoDrink(before, ev, base) });
+  const newFav = !wasFav && isFav(w.id) ? ' · ♥ neuer Lieblingswein' : '';
+  toast(`${left}${newFav}${res.total ? ` · +${res.total} XP` : ''}`, { action: 'Rückgängig', onAction: () => undoDrink(before, ev, base) });
+}
+
+/* ---------- stars and note for an opening, also afterwards ---------- */
+function openRate(evId) {
+  const e = state.events.find(x => x.id === evId);
+  const w = e && byId(e.wineId);
+  if (!e || !w) return;
+  state.rate = { id: e.id, rating: e.rating || 0 };
+  openSheet('rate', `<div class="grab"></div>
+    <div class="sheet-head"><h2>Wie war er?</h2><button class="icon-btn flat" data-action="close-sheet" aria-label="Schließen">${icon('x')}</button></div>
+    <div class="sheet-body">
+      <p class="muted center" style="margin:0 0 12px">${esc(wineTitle(w))}${w.vintage ? ` · ${w.vintage}` : ''} · ${fmtDate(e.date)}</p>
+      <div class="stars" role="group" aria-label="Bewertung">${[1, 2, 3, 4, 5].map(n => `<button type="button" data-rstar="${n}" class="${n <= e.rating ? 'on' : ''}" aria-label="${n} von 5 Sternen">★</button>`).join('')}</div>
+      <label class="field"><span>Notiz</span><textarea id="rate-note" rows="3" placeholder="Duft, Geschmack, zu welchem Essen …">${esc(e.note)}</textarea></label>
+    </div>
+    <div class="sheet-foot"><button class="btn ghost" data-action="close-sheet">Abbrechen</button><button class="btn primary" data-action="rate-save">Speichern</button></div>`,
+  { onClose: () => { state.rate = null; } });
+}
+
+async function saveRate() {
+  const r = state.rate;
+  const e = r && state.events.find(x => x.id === r.id);
+  const w = e && byId(e.wineId);
+  if (!e || !w) return;
+  const note = ($('#rate-note')?.value || '').trim().slice(0, 4000);
+  const wasFav = isFav(w.id);
+  // Points only the first time an opening gets a note or stars, never again for changing them.
+  const notePaid = !!(e.xpNote || e.note);
+  const ratePaid = !!(e.xpRating || e.rating);
+  const xp = w.demo ? 0 : (note && !notePaid ? XP.note : 0) + (r.rating && !ratePaid ? XP.rating : 0);
+  e.note = note;
+  e.rating = r.rating;
+  e.xpNote = notePaid || !!note;
+  e.xpRating = ratePaid || !!r.rating;
+  try { await db.put('events', e); } catch (_) { toast('Speichern hat nicht geklappt.'); }
+  closeSheet('rate');
+  render();
+  refreshDetail(w.id);
+  const res = await progress(xp);
+  const nowFav = !wasFav && isFav(w.id);
+  if (nowFav) celebrate('small');
+  toast(`${nowFav ? '♥ Neuer Lieblingswein' : 'Gespeichert'}${res.total ? ` · +${res.total} XP` : ''}`);
 }
 
 async function undoDrink(before, ev, xp) {
@@ -1466,6 +1663,8 @@ function viewSammlung() {
     s.value > 0 && ['Kellerwert', fmtEuro(Math.round(s.value))],
     ['Ältester Jahrgang', s.oldest || '—'],
     ['Lieblingsrebsorte', s.favorite ? esc(s.favorite) : '—'],
+    ['Flaschen getrunken', s.opened],
+    ['Lieblingsweine', s.loved],
     ['Verkostungsnotizen', s.notes],
     ['Gescannte Etiketten', s.scans],
   ].filter(Boolean);
@@ -1594,6 +1793,8 @@ function viewMehr() {
     <section class="panel">
       <h2 class="panel-title">${icon('download')} Deine Daten</h2>
       <p class="muted">Dein Keller liegt nur auf diesem Gerät. Mach ab und zu eine Sicherung.</p>
+      <p class="small">${lastBackup() ? `Letzte Sicherung: ${fmtDate(lastBackup())}` : 'Noch keine Sicherung auf diesem Gerät.'}</p>
+      ${isIos() && !standalone ? '<p class="small muted">In Safari kann iOS die Daten löschen, wenn du die Seite 7 Tage nicht öffnest. Auf dem Home-Bildschirm passiert das normalerweise nicht.</p>' : ''}
       <div class="row-btns"><button class="btn small" data-action="backup">${icon('download')} Sicherung speichern</button><button class="btn small" data-action="restore">${icon('upload')} Sicherung laden</button></div>
       <div class="row-btns">${hasDemo ? '<button class="btn ghost small" data-action="remove-demo">Beispielweine entfernen</button>' : (!state.wines.length ? '<button class="btn ghost small" data-action="demo">Beispielweine laden</button>' : '')}<button class="btn ghost small danger" data-action="wipe">${icon('trash')} Alles löschen</button></div>
     </section>
@@ -1646,8 +1847,13 @@ async function backup() {
     const name = `weinkeller-sicherung-${new Date().toISOString().slice(0, 10)}.json`;
     const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
     const file = typeof File === 'function' ? new File([blob], name, { type: 'application/json' }) : null;
-    if (file && navigator.canShare?.({ files: [file] })) {
-      try { await navigator.share({ files: [file], title: 'Weinkeller-Sicherung' }); return; } catch (e) { if (e.name === 'AbortError') return; }
+    // Phones: the share sheet ("In Dateien sichern", Drive, AirDrop). Computers: a normal download.
+    if (file && navigator.canShare?.({ files: [file] }) && matchMedia('(pointer: coarse)').matches) {
+      try {
+        await navigator.share({ files: [file], title: 'Weinkeller-Sicherung' });
+        backedUp();
+        return;
+      } catch (e) { if (e.name === 'AbortError') return; }
     }
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -1655,10 +1861,16 @@ async function backup() {
     document.body.appendChild(a);
     a.click();
     setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1500);
-    toast('Sicherung gespeichert');
+    backedUp();
   } catch (_) {
     toast('Die Sicherung hat nicht geklappt.');
   }
+}
+
+function backedUp() {
+  lsSet('wk.lastBackup', Date.now());
+  if (state.tab === 'keller' || state.tab === 'mehr') render();
+  toast('Sicherung gespeichert 💾');
 }
 
 function cleanWine(w) {
@@ -1697,7 +1909,7 @@ async function restore(file) {
     events: (Array.isArray(data.events) ? data.events : []).filter(e => e && e.id && e.wineId).map(e => ({
       id: String(e.id), wineId: String(e.wineId), type: 'open', date: Number(e.date) || Date.now(),
       rating: Math.max(0, Math.min(5, Math.round(Number(e.rating) || 0))), note: String(e.note ?? '').slice(0, 4000), inWindow: !!e.inWindow,
-      count: Math.max(1, Math.min(99, Math.round(Number(e.count) || 1))),
+      count: Math.max(1, Math.min(99, Math.round(Number(e.count) || 1))), xpNote: !!e.xpNote, xpRating: !!e.xpRating,
     })),
     meta: (Array.isArray(data.meta) ? data.meta : []).filter(m => m && (m.key === 'game' || m.key === 'places'))
       .map(m => (m.key === 'places' ? { key: 'places', value: cleanPlaces(m.value) } : m)),
@@ -1706,6 +1918,9 @@ async function restore(file) {
     try {
       await db.importAll(clean);
       await loadAll();
+      // The loaded file is a backup, so the reminder starts counting from its date.
+      const at = Date.parse(data.exportedAt);
+      lsSet('wk.lastBackup', Number.isFinite(at) && at <= Date.now() ? at : Date.now());
       render();
       toast(`${plural(clean.wines.length, 'Wein', 'Weine')} geladen`);
       celebrate('small');
@@ -1792,7 +2007,13 @@ async function wipe() {
 function onStorageClick(t) {
   const ds = t.dataset;
   if (ds.view) {
-    if (!VIEWS.includes(ds.view) || ds.view === state.view) return true;
+    // From "Getrunken" any view button goes back to the cellar.
+    const fromJournal = state.filter === 'getrunken';
+    if (!VIEWS.includes(ds.view) || (ds.view === state.view && !fromJournal)) return true;
+    if (fromJournal) {
+      state.filter = 'alle';
+      $$('[data-filter]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.filter === 'alle')));
+    }
     state.view = ds.view;
     try { localStorage.setItem('wk.view', state.view); } catch (_) { /* ignore */ }
     $$('[data-view]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.view === state.view)));
@@ -1809,6 +2030,14 @@ function onStorageClick(t) {
     state.draft.touched.add('sweetness');
     $$('[data-sweet]').forEach(b => b.setAttribute('aria-checked', String(b.dataset.sweet === d.sweetness)));
     buzz(6);
+    return true;
+  }
+  if (ds.rate) { openRate(ds.rate); return true; }
+  if (ds.rstar && state.rate) {
+    const n = Number(ds.rstar);
+    state.rate.rating = state.rate.rating === n ? 0 : n;
+    $$('[data-rstar]').forEach(b => b.classList.toggle('on', Number(b.dataset.rstar) <= state.rate.rating));
+    buzz(8);
     return true;
   }
   if (ds.dcount && state.drink) {
@@ -1910,6 +2139,13 @@ function onStorageClick(t) {
   }
   const a = ds.action;
   if (!a) return false;
+  if (a === 'rate-save') { saveRate(); return true; }
+  if (a === 'hide-safe') {
+    lsSet(`wk.hide.${ds.k === 'install' ? 'install' : 'backup'}`, Date.now());
+    const card = t.closest('.safe-card');
+    if (card && effectsOn()) { card.classList.add('out'); setTimeout(render, 220); } else render();
+    return true;
+  }
   if (a === 'new-place') {
     const from = t.closest('[data-sheet="form"]') ? 'form' : t.closest('[data-sheet="place"]') ? 'place' : '';
     openPlaceEditor(null, 'kuehlschrank', from);
@@ -1939,7 +2175,7 @@ function onStorageClick(t) {
 }
 
 function onClick(e) {
-  const t = e.target.closest('[data-action],[data-tab],[data-open],[data-filter],[data-color],[data-step],[data-star],[data-food],[data-loc],[data-search],[data-view],[data-place],[data-pplace],[data-slottoggle],[data-slotfree],[data-slotwine],[data-editplace],[data-newplace],[data-kind],[data-pstep],[data-sweet],[data-dcount],[data-foodgo],[data-moveto]');
+  const t = e.target.closest('[data-action],[data-tab],[data-open],[data-filter],[data-color],[data-step],[data-star],[data-food],[data-loc],[data-search],[data-view],[data-place],[data-pplace],[data-slottoggle],[data-slotfree],[data-slotwine],[data-editplace],[data-newplace],[data-kind],[data-pstep],[data-sweet],[data-dcount],[data-foodgo],[data-moveto],[data-rate],[data-rstar]');
   if (!t) return;
   if (t.dataset.tab) { goTab(t.dataset.tab); return; }
   if (t.dataset.open) { openDetail(t.dataset.open); return; }
@@ -2115,11 +2351,16 @@ function bind() {
   document.addEventListener('visibilitychange', () => {
     if (document.hidden && sheetEl('camera')) closeSheet('camera');
   });
+  // Re-draw for the install button, but never while someone is typing.
+  const quietRender = () => {
+    if (['mehr', 'keller'].includes(state.tab) && !document.activeElement?.closest?.('#view input, #view textarea, #view select')) render();
+  };
   window.addEventListener('beforeinstallprompt', e => {
     e.preventDefault();
     deferredPrompt = e;
-    if (state.tab === 'mehr') render();
+    quietRender();
   });
+  window.addEventListener('appinstalled', () => { deferredPrompt = null; quietRender(); });
 }
 
 /* ---------- start ---------- */

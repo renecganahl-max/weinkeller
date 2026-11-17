@@ -38,6 +38,14 @@ export function computeStats(allWines, events, game) {
   const newest = vintages.length ? Math.max(...vintages) : null;
   let favorite = null;
   for (const [g, n] of grapes) if (!favorite || n > favorite[1]) favorite = [g, n];
+  // Favourite wines: 4 stars or more on average.
+  const rated = new Map();
+  for (const e of evs) {
+    if (!(e.rating > 0)) continue;
+    const r = rated.get(e.wineId) || [0, 0];
+    rated.set(e.wineId, [r[0] + e.rating, r[1] + 1]);
+  }
+  const loved = [...rated.values()].filter(([sum, n]) => sum / n >= 4).length;
 
   return {
     wineCount: wines.length,
@@ -58,6 +66,7 @@ export function computeStats(allWines, events, game) {
     sommelier: game.sommelier || 0,
     value: stock.reduce((a, w) => a + (w.price || 0) * w.qty, 0),
     favorite: favorite ? favorite[0] : null,
+    loved,
   };
 }
 
