@@ -2,13 +2,47 @@
 
 import { norm, thisYear, yearFrac } from './util.js';
 
+// Wine types. The last three only show up when "Mehr Arten" is switched on in the settings.
 export const COLORS = {
   rot: { label: 'Rot', dot: '#8e1b3a' },
   weiss: { label: 'Weiß', dot: '#e3cf6e' },
   rose: { label: 'Rosé', dot: '#f0a3b6' },
+  orange: { label: 'Orange', dot: '#e08a3c', extra: true },
   schaum: { label: 'Schaumwein', dot: '#efe0a1' },
+  perl: { label: 'Perlwein', dot: '#f3e7b5', extra: true },
   suess: { label: 'Süßwein', dot: '#d9962b' },
+  likoer: { label: 'Likörwein', dot: '#7b3f1d', extra: true },
 };
+export const typeKeys = (more, current = '') => {
+  const keys = Object.keys(COLORS).filter(k => more || !COLORS[k].extra);
+  if (current && COLORS[current] && !keys.includes(current)) keys.push(current);
+  return keys;
+};
+// Extra types behave like their closest basic type (for food pairing and the like).
+export const baseType = c => ({ orange: 'weiss', perl: 'schaum', likoer: 'suess' }[c] || c);
+
+// Sweetness ("Geschmacksrichtung"): still wines and sparkling wines use different words.
+const SWEET_STILL = ['trocken', 'halbtrocken', 'lieblich', 'süß'];
+const SWEET_SPARK = ['brut nature', 'extra brut', 'brut', 'extra trocken', 'trocken', 'halbtrocken', 'mild'];
+const SWEET_SCORE = { 'trocken': 1, 'halbtrocken': 2, 'lieblich': 3, 'süß': 5, 'brut nature': 1, 'extra brut': 1, 'brut': 1, 'extra trocken': 2, 'mild': 4 };
+export const isFizzy = c => c === 'schaum' || c === 'perl';
+export const sweetOptions = c => (isFizzy(c) ? SWEET_SPARK : SWEET_STILL);
+export const sweetLabel = v => String(v || '').replace(/(^|\s)\p{Ll}/gu, s => s.toUpperCase());
+export function normSweet(value, color) {
+  const s = norm(value);
+  if (!s) return '';
+  const fizzy = isFizzy(color);
+  if (/brut nature|naturherb|pas dose|dosage zero|zero dosage/.test(s)) return 'brut nature';
+  if (/extra brut/.test(s)) return 'extra brut';
+  if (/\bbrut\b/.test(s)) return 'brut';
+  if (/extra (dry|trocken|sec)/.test(s)) return fizzy ? 'extra trocken' : 'trocken';
+  if (/halbtrocken|semi ?secco|demi ?sec|medium dry|off ?dry|feinherb/.test(s)) return 'halbtrocken';
+  if (/lieblich|amabile|medium sweet|moelleux/.test(s)) return fizzy ? 'mild' : 'lieblich';
+  if (/\bmild\b|\bdoux\b|dolce/.test(s)) return fizzy ? 'mild' : 'süß';
+  if (/suss|suess|sweet|dolce|dessert/.test(s)) return fizzy ? 'mild' : 'süß';
+  if (/trocken|\bdry\b|\bsec\b|secco|seco/.test(s)) return 'trocken';
+  return '';
+}
 
 export const STATUS = {
   lagern: { label: 'Lagern' },
@@ -119,8 +153,11 @@ const GRAPE_TASTE = {
   'Grenache': [4, 2, 1, 2], 'Tempranillo': [4, 4, 1, 3], 'Sangiovese': [3, 4, 1, 5],
   'Nebbiolo': [4, 5, 1, 5], 'Malbec': [5, 4, 1, 3], 'Primitivo': [5, 3, 2, 2],
 };
-const COLOR_TASTE = { rot: [3, 3, 1, 3], weiss: [2, null, 1, 4], rose: [2, null, 1, 3], schaum: [2, null, 1, 4], suess: [3, null, 5, 3] };
-const COLOR_NAMES = { rot: 'Rotwein', weiss: 'Weißwein', rose: 'Rosé', schaum: 'Schaumwein', suess: 'Süßwein' };
+const COLOR_TASTE = {
+  rot: [3, 3, 1, 3], weiss: [2, null, 1, 4], rose: [2, null, 1, 3], schaum: [2, null, 1, 4], suess: [3, null, 5, 3],
+  orange: [3, null, 1, 3], perl: [2, null, 2, 3], likoer: [5, null, 5, 2],
+};
+const COLOR_NAMES = { rot: 'Rotwein', weiss: 'Weißwein', rose: 'Rosé', schaum: 'Schaumwein', suess: 'Süßwein', orange: 'Orange-Wein', perl: 'Perlwein', likoer: 'Likörwein' };
 
 const clamp5 = v => {
   const n = Math.round(Number(v));
@@ -136,7 +173,10 @@ export function cleanTaste(t) {
 // Stored AI estimate first; otherwise the typical profile of the grape(s) or the wine type.
 export function tasteOf(w) {
   const own = cleanTaste(w.taste);
-  if (own) return { values: own, source: 'ai' };
+  if (own) {
+    if (SWEET_SCORE[w.sweetness]) own.sweet = SWEET_SCORE[w.sweetness];
+    return { values: own, source: 'ai' };
+  }
   const known = grapesOf(w).filter(g => GRAPE_TASTE[g]);
   let base = null;
   let label = '';
@@ -152,11 +192,62 @@ export function tasteOf(w) {
   }
   if (!base) return null;
   if (w.color && w.color !== 'rot') base[1] = null;
-  if (w.color === 'suess') base[2] = 5;
+  if (w.color === 'suess' || w.color === 'likoer') base[2] = 5;
   if (w.color === 'rose') base[0] = Math.min(base[0] ?? 2, 2);
-  if (w.color === 'schaum') { base[0] = Math.min(base[0] ?? 2, 3); base[3] = Math.max(base[3] ?? 4, 4); }
+  if (isFizzy(w.color)) { base[0] = Math.min(base[0] ?? 2, 3); base[3] = Math.max(base[3] ?? 4, 4); }
+  if (SWEET_SCORE[w.sweetness]) base[2] = SWEET_SCORE[w.sweetness];
+  // Not every Grüner is the same: words on the label shift the typical profile.
+  const words = norm(`${w.name} ${w.producer} ${w.grape}`);
+  const terms = [];
+  const bump = (i, d) => { if (base[i] != null) base[i] = Math.max(1, Math.min(5, base[i] + d)); };
+  if (/\bsteinfeder\b/.test(words)) { base[0] = Math.min(base[0] ?? 2, 2); terms.push('Steinfeder'); }
+  if (/\bfederspiel\b/.test(words)) { base[0] = 3; terms.push('Federspiel'); }
+  if (/\bsmaragd\b/.test(words)) { base[0] = Math.max(4, (base[0] ?? 3) + 1); terms.push('Smaragd'); }
+  if (/\bkabinett\b/.test(words)) { base[0] = Math.min(base[0] ?? 2, 2); terms.push('Kabinett'); }
+  if (/\b(reserve|reserva|riserva)\b/.test(words)) { bump(0, 1); bump(1, 1); terms.push('Reserve'); }
+  if (/\b(ried|grand cru|premier cru|1er cru|erste lage|grosse lage)\b/.test(words)) { bump(0, 1); terms.push('Lage'); }
+  if (/\b(barrique|holzfass|oak)\b/.test(words)) { bump(0, 1); terms.push('Barrique'); }
+  if (/\b(klassik|classic|junger|heuriger)\b/.test(words)) { bump(0, -1); terms.push('Klassik'); }
+  if (/\b(auslese|beerenauslese|trockenbeerenauslese|eiswein|ausbruch|strohwein)\b/.test(words)) { base[2] = 5; terms.push('Prädikat'); }
+  if (terms.length) label = `${label}, ${terms[0]}`;
   const [body, tannin, sweet, acid] = base;
   return { values: { body, tannin, sweet, acid }, source: 'typical', label };
+}
+
+// ---------- food per wine ----------
+const GRAPE_FOOD = {
+  'Grüner Veltliner': ['Wiener Schnitzel', 'Spargel', 'Backhendl'], 'Riesling': ['Forelle', 'Asiatisch', 'Schweinsbraten'],
+  'Welschriesling': ['Jause', 'Salat', 'Fisch'], 'Gelber Muskateller': ['Aperitif', 'Spargel', 'Thai-Curry'],
+  'Weißburgunder': ['Kalbfleisch', 'Huhn', 'Pilze'], 'Chardonnay': ['Huhn', 'Lachs', 'Pasta mit Rahm'],
+  'Sauvignon Blanc': ['Ziegenkäse', 'Fisch', 'Salat'], 'Gewürztraminer': ['Curry', 'Käse', 'Ente'],
+  'Grauburgunder': ['Kürbis', 'Pilze', 'Geflügel'], 'Chenin Blanc': ['Schwein', 'Fisch', 'Käse'],
+  'Blaufränkisch': ['Wild', 'Lamm', 'Gulasch'], 'Zweigelt': ['Pizza', 'Grillwürstel', 'Schweinsbraten'],
+  'St. Laurent': ['Ente', 'Pilze', 'Wild'], 'Pinot Noir': ['Ente', 'Lachs', 'Pilzrisotto'],
+  'Merlot': ['Rind', 'Pasta', 'Käse'], 'Cabernet Sauvignon': ['Steak', 'Lamm', 'Hartkäse'],
+  'Cabernet Franc': ['Lamm', 'Gemüse', 'Huhn'], 'Syrah': ['Grill', 'Wild', 'Würzige Küche'],
+  'Grenache': ['Grill', 'Eintopf', 'Lamm'], 'Tempranillo': ['Lamm', 'Chorizo', 'Manchego'],
+  'Sangiovese': ['Pasta mit Tomate', 'Pizza', 'Bistecca'], 'Nebbiolo': ['Trüffel', 'Wild', 'Risotto'],
+  'Malbec': ['Steak', 'Grill', 'Empanadas'], 'Primitivo': ['Pizza', 'Grill', 'Lasagne'],
+};
+const TYPE_FOOD = {
+  rot: ['Rind', 'Wild', 'Käse'], weiss: ['Fisch', 'Geflügel', 'Salat'], rose: ['Salat', 'Pizza', 'Grill'],
+  schaum: ['Aperitif', 'Austern', 'Sushi'], suess: ['Dessert', 'Blauschimmelkäse', 'Obst'],
+  orange: ['Würzige Küche', 'Käse', 'Gemüse'], perl: ['Aperitif', 'Antipasti', 'Jause'], likoer: ['Schokolade', 'Käse', 'Nüsse'],
+};
+
+export function cleanPairing(list) {
+  return (Array.isArray(list) ? list : [])
+    .map(v => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, 32)).filter(Boolean).slice(0, 3);
+}
+
+// Dishes for this wine: the AI's suggestion from the label scan, else what fits the grape or type.
+export function pairingOf(w) {
+  const own = cleanPairing(w.pairing);
+  if (own.length) return { dishes: own, source: 'ai' };
+  const g = grapesOf(w).find(x => GRAPE_FOOD[x]);
+  if (g) return { dishes: GRAPE_FOOD[g], source: 'typical', label: g };
+  if (TYPE_FOOD[w.color]) return { dishes: TYPE_FOOD[w.color], source: 'typical', label: COLOR_NAMES[w.color] };
+  return { dishes: [], source: '' };
 }
 
 // ---------- countries ----------
@@ -204,7 +295,7 @@ const AT_REGIONS = ['wachau', 'kamptal', 'kremstal', 'wagram', 'traisental', 'we
 
 export const isAustrian = w => normCountry(w.country) === 'Österreich' || AT_REGIONS.some(r => norm(w.region).includes(r));
 
-export const isSparkling = w => w.color === 'schaum' ||
+export const isSparkling = w => isFizzy(w.color) ||
   /\b(sekt|champagne|champagner|cremant|prosecco|cava|franciacorta|pet nat|frizzante|spumante)\b/.test(norm(`${w.name} ${w.producer} ${w.grape}`));
 
 // Same wine = same producer, same name (or grape) and same vintage.
@@ -227,6 +318,9 @@ const BOTTLE_LOOK = {
   rose: { shape: 'burgundy', glass: '#ee9db3', cap: '#f8dbe3', label: '#fffaf6', ink: '#a23256' },
   schaum: { shape: 'champagne', glass: '#22301f', cap: '#d6b25e', label: '#f6efd9', ink: '#22301f' },
   suess: { shape: 'half', glass: '#c98a24', cap: '#7a4a12', label: '#fbf2df', ink: '#7a4a12' },
+  orange: { shape: 'flute', glass: '#d98d45', cap: '#f2d2a8', label: '#fff6ea', ink: '#8a4a14' },
+  perl: { shape: 'burgundy', glass: '#b9cf94', cap: '#f3e7b5', label: '#fbf8ea', ink: '#5d6b2c' },
+  likoer: { shape: 'bordeaux', glass: '#3a1a0a', cap: '#c9a35a', label: '#f3e6cf', ink: '#5a2a0e' },
   none: { shape: 'bordeaux', glass: '#4a3d44', cap: '#8b7f86', label: '#efe8ea', ink: '#4a3d44' },
 };
 
@@ -248,6 +342,29 @@ export function bottleSvg(w, height = 70) {
 }
 
 export const tileClass = w => `tile tile-${COLORS[w.color] ? w.color : 'none'}`;
+
+// ---------- storage places ("Lager") ----------
+export const PLACE_KINDS = {
+  keller: { label: 'Kellerregal', emoji: '🧱', rows: 6, cols: 8, desc: 'Regal mit Reihen und Plätzen' },
+  kuehlschrank: { label: 'Weinkühlschrank', emoji: '🧊', rows: 6, cols: 6, desc: 'Fächer mit festen Plätzen' },
+  regal: { label: 'Weinregal', emoji: '🪵', rows: 4, cols: 6, desc: 'Kleines Regal, etwa in der Küche' },
+  kiste: { label: 'Kiste oder Karton', emoji: '📦', rows: 0, cols: 0, desc: 'Ohne feste Plätze' },
+  sonst: { label: 'Anderer Ort', emoji: '🏠', rows: 0, cols: 0, desc: 'Ferienhaus, Büro, Eltern …' },
+};
+export const hasGrid = p => !!p && p.rows > 0 && p.cols > 0;
+export const slotLabel = key => {
+  const [r, c] = String(key).split('-').map(Number);
+  return `${String.fromCharCode(64 + r)}${c}`;
+};
+export const slotKeys = p => {
+  const out = [];
+  for (let r = 1; r <= p.rows; r++) for (let c = 1; c <= p.cols; c++) out.push(`${r}-${c}`);
+  return out;
+};
+export const validSlot = (p, key) => {
+  const [r, c] = String(key).split('-').map(Number);
+  return hasGrid(p) && r >= 1 && r <= p.rows && c >= 1 && c <= p.cols;
+};
 
 // ---------- links to comparison platforms ----------
 const searchTerms = w => [w.producer, w.name || w.grape].filter(Boolean).join(' ').trim();
@@ -283,8 +400,12 @@ export function rankForFood(wines, food) {
     let score = STATUS_SCORE[status(w)];
     let fits = false;
     for (const r of rules) {
-      if (w.color && r.colors.includes(w.color)) { score += 3; fits = true; }
+      if (w.color && r.colors.includes(baseType(w.color))) { score += 3; fits = true; }
       if (grapesOf(w).some(g => r.grapes.includes(g))) { score += 3; fits = true; }
+    }
+    // The wine's own dishes (from the label scan or its grape) count extra.
+    if (f && pairingOf(w).dishes.some(d => { const n = norm(d); return n && (f.includes(n) || n.includes(f) || n.split(' ').some(x => x.length > 3 && f.includes(x))); })) {
+      score += 4; fits = true;
     }
     return { w, score, fits };
   }).sort((a, b) => b.score - a.score);

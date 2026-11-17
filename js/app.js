@@ -7,6 +7,7 @@ import { fileToImage, imageToDataUrl } from './image.js';
 import {
   COLORS, STATUS, status, windowBar, vivinoUrl, wineSearcherUrl, GRAPES, grapesOf, normCountry, FLAGS,
   rankForFood, pairingReason, matchKey, bottleSvg, tileClass, flagOf, tasteOf, cleanTaste,
+  typeKeys, sweetOptions, sweetLabel, PLACE_KINDS, hasGrid, slotLabel, slotKeys, validSlot, pairingOf, cleanPairing,
 } from './wine.js';
 import { XP, levelInfo, computeStats, ACHIEVEMENTS, newlyUnlocked, confetti } from './game.js';
 import { aiReady, isMock, readLabel, askSommelier, settings, saveSettings, testKey, freeVisionModels, modelLabel, AUTO_MODELS } from './ai.js';
@@ -19,11 +20,13 @@ const TABS = [
   { id: 'sommelier', label: 'Sommelier', icon: 'sparkles' },
   { id: 'mehr', label: 'Mehr', icon: 'sliders' },
 ];
-const FILTERS = [
-  { id: 'alle', label: 'Alle' }, { id: 'trinkreif', label: '🍷 Trinkreif' }, { id: 'rot', label: 'Rot' },
-  { id: 'weiss', label: 'Weiß' }, { id: 'rose', label: 'Rosé' }, { id: 'schaum', label: 'Schaumwein' },
-  { id: 'suess', label: 'Süß' }, { id: 'leer', label: 'Ausgetrunken' },
+// Filter chips follow the type setting ("Mehr Arten" adds Orange, Perlwein, Likörwein).
+const filters = () => [
+  { id: 'alle', label: 'Alle' }, { id: 'trinkreif', label: '🍷 Trinkreif' },
+  ...typeKeys(!!settings().moreTypes).map(k => ({ id: k, label: COLORS[k].label })),
+  { id: 'leer', label: 'Ausgetrunken' },
 ];
+const VIEWS = ['list', 'grid', 'places'];
 const SORTS = [
   { id: 'neu', label: 'Neueste' }, { id: 'reife', label: 'Trinkreife' },
   { id: 'winzer', label: 'Winzer A–Z' }, { id: 'jahrgang', label: 'Jahrgang' },
@@ -47,7 +50,11 @@ const state = {
   events: [],
   game: { xp: 0, unlocked: {}, scans: 0, sommelier: 0 },
   tab: 'keller',
-  view: (() => { try { return localStorage.getItem('wk.view') === 'grid' ? 'grid' : 'list'; } catch (_) { return 'list'; } })(),
+  view: (() => { try { const v = localStorage.getItem('wk.view'); return VIEWS.includes(v) ? v : 'list'; } catch (_) { return 'list'; } })(),
+  places: [],
+  pendingSlot: null,
+  placeDraft: null,
+  placing: null,
   query: '',
   filter: 'alle',
   sort: 'neu',
@@ -69,6 +76,72 @@ const byId = id => state.wines.find(w => w.id === id);
 const inStock = () => state.wines.filter(w => w.qty > 0);
 const saveGame = () => db.setMeta('game', state.game).catch(() => {});
 const wineTitle = w => w.producer || w.name || w.grape || 'Unbekannter Wein';
+
+/* ---------- storage places ("Lager") ---------- */
+const placeById = id => (id && state.places.find(p => p.id === id)) || null;
+const kindOf = p => PLACE_KINDS[p?.kind] || PLACE_KINDS.sonst;
+const savePlaces = () => db.setMeta('places', state.places).catch(() => {});
+
+// Which wine lies in which slot of a place (opened-up wines with 0 bottles take no space).
+function occupancy(place, exceptId = null) {
+  const map = new Map();
+  for (const w of state.wines) {
+    if (w.placeId !== place.id || w.id === exceptId || w.qty <= 0) continue;
+    for (const k of w.slots || []) if (validSlot(place, k)) map.set(k, w);
+  }
+  return map;
+}
+
+// Keeps valid free slots and fills up to qty with the next free ones (row by row).
+function autoSlots(place, exceptId, current, qty) {
+  if (!hasGrid(place)) return [];
+  const occ = occupancy(place, exceptId);
+  const keep = (current || []).filter(k => validSlot(place, k) && !occ.has(k)).slice(0, qty);
+  const free = slotKeys(place).filter(k => !occ.has(k) && !keep.includes(k));
+  return keep.concat(free.slice(0, Math.max(0, qty - keep.length)));
+}
+
+// A rack as seen from the front: every bottle is a coloured circle.
+// modes: view (tap bottle = details, tap empty = add), pick (choose slots), mine (show one wine), preview.
+function rackHtml(place, { mode = 'view', wineId = null, picked = [], color = '', match = null, size = '' } = {}) {
+  const occ = occupancy(place, mode === 'pick' ? wineId : null);
+  const cells = ['<span class="rl"></span>'];
+  for (let c = 1; c <= place.cols; c++) cells.push(`<span class="rl">${c}</span>`);
+  for (let r = 1; r <= place.rows; r++) {
+    cells.push(`<span class="rl">${String.fromCharCode(64 + r)}</span>`);
+    for (let c = 1; c <= place.cols; c++) {
+      const key = `${r}-${c}`;
+      const name = slotLabel(key);
+      const w = occ.get(key);
+      const t = w ? `t-${COLORS[w.color] ? w.color : 'none'}` : '';
+      if (mode === 'pick') {
+        if (picked.includes(key)) cells.push(`<button type="button" class="slot full t-${COLORS[color] ? color : 'none'} pick" data-slottoggle="${key}" aria-label="${name}: gewählt"></button>`);
+        else if (w) cells.push(`<span class="slot full ${t} other" title="${esc(wineTitle(w))}"></span>`);
+        else cells.push(`<button type="button" class="slot" data-slottoggle="${key}" aria-label="${name}: frei"></button>`);
+      } else if (mode === 'mine' || mode === 'preview') {
+        const cls = mode === 'mine' && w ? (w.id === wineId ? ' mine' : ' dim') : '';
+        cells.push(`<span class="slot${w ? ` full ${t}${cls}` : ''}"></span>`);
+      } else if (w) {
+        const cls = match ? (match.has(w.id) ? ' match' : ' dim') : '';
+        cells.push(`<button type="button" class="slot full ${t}${cls}" data-open="${w.id}" aria-label="${name}: ${esc(wineTitle(w))}${w.vintage ? ` ${w.vintage}` : ''}"></button>`);
+      } else {
+        cells.push(`<button type="button" class="slot" data-slotfree="${place.id}|${key}" aria-label="${name}: frei"></button>`);
+      }
+    }
+  }
+  return `<div class="rack rack-${place.kind} ${size}" style="--cols:${place.cols}">${cells.join('')}</div>`;
+}
+
+// A box or other place without fixed slots: just the bottles, one circle each.
+function crateHtml(place, { match = null } = {}) {
+  const dots = state.wines.filter(w => w.placeId === place.id && w.qty > 0)
+    .flatMap(w => Array.from({ length: Math.min(w.qty, 36) }, () => w));
+  if (!dots.length) return '<div class="crate empty">Noch leer. Wähl dieses Lager beim Eintragen eines Weins.</div>';
+  return `<div class="crate">${dots.map(w => {
+    const cls = match ? (match.has(w.id) ? ' match' : ' dim') : '';
+    return `<button type="button" class="slot full t-${COLORS[w.color] ? w.color : 'none'}${cls}" data-open="${w.id}" aria-label="${esc(wineTitle(w))}"></button>`;
+  }).join('')}</div>`;
+}
 
 function celebrate(kind = 'small') {
   if (!effectsOn()) return;
@@ -362,10 +435,12 @@ function viewKeller() {
     </form>` : ''}
     <div class="search-row">
       <div class="search">${icon('search')}<input id="q" type="search" placeholder="Winzer, Rebsorte, Jahrgang …" value="${esc(state.query)}" autocomplete="off" enterkeyhint="search" aria-label="Keller durchsuchen"></div>
-      <button class="icon-btn view-toggle" data-action="toggle-view" aria-label="${state.view === 'grid' ? 'Als Liste zeigen' : 'Als Regal zeigen'}">${icon(state.view === 'grid' ? 'list' : 'grid')}</button>
+      <div class="viewseg" role="group" aria-label="Ansicht">
+        ${[['list', 'list', 'Liste'], ['grid', 'grid', 'Galerie'], ['places', 'rack', 'Lager']].map(([v, ic, label]) => `<button data-view="${v}" aria-pressed="${state.view === v}" aria-label="${label}" title="${label}">${icon(ic)}</button>`).join('')}
+      </div>
     </div>
     <div class="chips" role="toolbar" aria-label="Filter">
-      ${FILTERS.map(f => `<button class="chip" data-filter="${f.id}" aria-pressed="${state.filter === f.id}">${f.label}</button>`).join('')}
+      ${filters().map(f => `<button class="chip" data-filter="${f.id}" aria-pressed="${state.filter === f.id}">${f.label}</button>`).join('')}
       <label class="chip sort">${icon('sort')}<select id="sort" aria-label="Sortieren">${SORTS.map(s => `<option value="${s.id}"${state.sort === s.id ? ' selected' : ''}>${s.label}</option>`).join('')}</select></label>
     </div>
     <div id="list" class="list"></div>`;
@@ -448,11 +523,19 @@ function renderList() {
   if (state.filter === 'trinkreif') list = list.filter(w => READY.includes(status(w)));
   if (words.length) {
     list = list.filter(w => {
-      const hay = norm([w.producer, w.name, w.grape, w.vintage, w.region, w.country, w.location, w.notes, ...grapesOf(w)].join(' '));
+      const place = placeById(w.placeId);
+      const hay = norm([w.producer, w.name, w.grape, w.vintage, w.region, w.country, w.location, w.notes, w.sweetness, place?.name, ...grapesOf(w)].join(' '));
       return words.every(x => hay.includes(x));
     });
   }
   list.sort(SORTERS[state.sort] || SORTERS.neu);
+  if (state.view === 'places') {
+    // In the storage view a search or filter makes the matching bottles light up.
+    const active = words.length || state.filter !== 'alle';
+    el.className = 'places';
+    el.innerHTML = placesHtml(active ? new Set(list.map(w => w.id)) : null);
+    return;
+  }
   const grid = state.view === 'grid' && list.length;
   el.className = grid ? 'shelf' : 'list';
   el.innerHTML = list.length
@@ -460,6 +543,27 @@ function renderList() {
     : `<div class="none">${words.length || state.filter !== 'alle' ? 'Nichts gefunden. 🔍' : 'Keine Flaschen im Keller.'}</div>`;
   const hit = el.querySelector('.flash');
   if (hit) hit.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+
+// Storage view: one card per place with its rack or box.
+function placesHtml(match) {
+  if (!state.places.length) {
+    return `<section class="places-empty">
+      <div class="art">🗄️</div>
+      <h3>Wo liegen deine Weine?</h3>
+      <p class="muted">Leg ein Lager an, dann siehst du jede Flasche an ihrem Platz.</p>
+      <div class="kind-row">${Object.entries(PLACE_KINDS).map(([key, k]) => `<button class="kind-chip" data-newplace="${key}"><span>${k.emoji}</span>${k.label}</button>`).join('')}</div>
+    </section>`;
+  }
+  const loose = inStock().filter(w => !placeById(w.placeId)).length;
+  return state.places.map(p => {
+    const bottles = state.wines.filter(w => w.placeId === p.id && w.qty > 0).reduce((a, w) => a + w.qty, 0);
+    const sub = hasGrid(p) ? `${occupancy(p).size} von ${p.rows * p.cols} Plätzen belegt` : plural(bottles, 'Flasche', 'Flaschen');
+    return `<section class="place-card">
+      <div class="place-head"><span class="place-emoji">${kindOf(p).emoji}</span><span class="place-text"><b>${esc(p.name)}</b><small>${sub}</small></span><button class="icon-btn flat" data-editplace="${p.id}" aria-label="${esc(p.name)} bearbeiten">${icon('edit')}</button></div>
+      ${hasGrid(p) ? rackHtml(p, { match }) : crateHtml(p, { match })}
+    </section>`;
+  }).join('') + `<div class="places-foot">${loose ? `<span class="muted small">${plural(loose, 'Wein', 'Weine')} ohne Lager, siehe Liste.</span>` : '<span></span>'}<button class="btn ghost small" data-action="new-place">${icon('plus')} Lager</button></div>`;
 }
 
 // Shelf view: big bottle or label photo per wine, two or three per row.
@@ -484,18 +588,61 @@ function shelfCard(w, i = 0) {
 
 /* ---------- add & edit ---------- */
 const emptyWine = () => ({
-  producer: '', name: '', grape: '', vintage: '', color: '', region: '', country: '',
-  drinkFrom: '', drinkTo: '', location: '', price: '', qty: 1, notes: '', photo: '',
+  producer: '', name: '', grape: '', vintage: '', color: '', sweetness: '', region: '', country: '',
+  drinkFrom: '', drinkTo: '', location: '', price: '', qty: 1, notes: '', photo: '', placeId: '', slots: [],
 });
 
 function openForm(wine = null, { photo = '' } = {}) {
   const isNew = !wine;
+  const data = wine ? { ...emptyWine(), ...wine, slots: [...(wine.slots || [])] } : { ...emptyWine(), photo };
+  if (isNew) {
+    // Low friction: a tapped empty slot, otherwise the last used place with the next free slot.
+    // A slot tapped in the storage view counts for ten minutes (scan or type the wine).
+    const pending = state.pendingSlot && Date.now() - state.pendingSlot.t < 600000 ? state.pendingSlot : null;
+    state.pendingSlot = null;
+    const p = placeById(pending?.placeId) || placeById(settings().lastPlace);
+    if (p) {
+      data.placeId = p.id;
+      data.slots = pending && pending.placeId === p.id ? [pending.key] : autoSlots(p, null, [], 1);
+    }
+  }
   state.draft = {
-    token: uid(), id: wine?.id || null, isNew, orig: wine ? { ...wine } : null,
-    data: wine ? { ...emptyWine(), ...wine } : { ...emptyWine(), photo },
-    touched: new Set(), unsure: [], scanned: !!wine?.scanned, aiModel: wine?.aiModel || '', aiImage: null,
+    token: uid(), id: wine?.id || null, isNew, orig: wine ? { ...wine } : null, data,
+    touched: new Set(), unsure: [], scanned: !!wine?.scanned, aiModel: wine?.aiModel || '', aiImage: null, rackOpen: false,
   };
   openSheet('form', formHtml(), { cls: 'tall', onClose: () => { state.draft = null; } });
+}
+
+function sweetHtml(d) {
+  if (!settings().moreTypes) return '';
+  const opts = sweetOptions(d.color);
+  return `<div class="field"><span>Geschmacksrichtung</span><div class="seg" role="radiogroup" aria-label="Geschmacksrichtung">${opts.map(v => `<button type="button" class="seg-btn" role="radio" data-sweet="${v}" aria-checked="${d.sweetness === v}">${sweetLabel(v)}</button>`).join('')}</div></div>`;
+}
+
+// Storage in the form: one tap picks the place, free slots are suggested automatically.
+function placeSection(d) {
+  if (!state.places.length) {
+    return `${field('location', 'Lagerort', d.location, { list: 'dl-locations', placeholder: 'Regal 2, Fach 3' })}
+      ${locationChips(d.location)}
+      <p class="small muted place-hint">Tipp: <button type="button" class="link" data-action="new-place">Lager mit Plan anlegen</button>, etwa einen Weinkühlschrank.</p>`;
+  }
+  return `<div class="field"><span>Lager</span><div class="seg" role="radiogroup" aria-label="Lager">${state.places.map(p => `<button type="button" class="seg-btn" role="radio" data-place="${p.id}" aria-checked="${d.placeId === p.id}">${kindOf(p).emoji} ${esc(p.name)}</button>`).join('')}<button type="button" class="seg-btn add" data-action="new-place" aria-label="Neues Lager anlegen">${icon('plus')}</button></div></div>
+    <div id="form-slots">${formSlotsHtml(d)}</div>`;
+}
+
+function formSlotsHtml(d) {
+  const p = placeById(d.placeId);
+  if (!p || !hasGrid(p)) return '';
+  const picked = d.slots || [];
+  const open = state.draft?.rackOpen;
+  return `<div class="slot-line">${icon('pin')}<span>${picked.length ? `Platz ${picked.map(slotLabel).join(', ')}` : 'Noch kein fester Platz'}</span><button type="button" class="link" data-action="toggle-rack">${open ? 'Fertig' : 'Ändern'}</button></div>
+    ${open ? `${rackHtml(p, { mode: 'pick', wineId: state.draft.id, picked, color: d.color, size: 'rack-compact' })}
+      <div class="slot-tools"><button type="button" class="link" data-action="auto-slots">Automatisch</button><button type="button" class="link" data-action="clear-slots">Ohne festen Platz</button></div>` : ''}`;
+}
+
+function refreshFormSlots() {
+  const el = $('#form-slots');
+  if (el && state.draft) el.innerHTML = formSlotsHtml(state.draft.data);
 }
 
 function field(key, label, value, o = {}) {
@@ -556,10 +703,11 @@ function formHtml() {
         ${field('vintage', 'Jahrgang', d.vintage ?? '', { big: true, inputmode: 'numeric', placeholder: String(thisYear() - 2), maxlength: 4 })}
         <div class="field"><span>Flaschen</span>${stepper('qty', d.qty ?? 1)}</div>
       </div>
-      <div class="field"><span>Art</span><div class="seg" role="radiogroup" aria-label="Art">${Object.entries(COLORS).map(([k, c]) => `<button type="button" class="seg-btn" role="radio" data-color="${k}" aria-checked="${d.color === k}"><i class="cdot" style="background:${c.dot}"></i>${c.label}</button>`).join('')}</div></div>
-      ${field('location', 'Lagerort', d.location, { list: 'dl-locations', placeholder: 'Regal 2, Fach 3' })}
-      ${locationChips(d.location)}
+      <div class="field"><span>Art</span><div class="seg" role="radiogroup" aria-label="Art">${typeKeys(!!settings().moreTypes, d.color).map(k => `<button type="button" class="seg-btn" role="radio" data-color="${k}" aria-checked="${d.color === k}"><i class="cdot" style="background:${COLORS[k].dot}"></i>${COLORS[k].label}</button>`).join('')}</div></div>
+      <div id="sweet-field">${sweetHtml(d)}</div>
+      ${placeSection(d)}
       <details class="more"${isNew ? '' : ' open'}><summary>Mehr Details ${icon('chevron')}</summary>
+        ${state.places.length ? field('location', 'Notiz zum Ort', d.location, { list: 'dl-locations', placeholder: 'z. B. hinten links' }) : ''}
         ${field('name', 'Wein, Lage oder Cuvée', d.name, { placeholder: 'z. B. Ried Heiligenstein', cap: 'words' })}
         <div class="row2">${field('region', 'Region', d.region, { list: 'dl-regions', cap: 'words' })}${field('country', 'Land', d.country, { list: 'dl-countries', cap: 'words' })}</div>
         <div class="row2">${field('drinkFrom', 'Trinken ab', d.drinkFrom ?? '', { inputmode: 'numeric', maxlength: 4, placeholder: 'Jahr' })}${field('drinkTo', 'Trinken bis', d.drinkTo ?? '', { inputmode: 'numeric', maxlength: 4, placeholder: 'Jahr' })}</div>
@@ -587,7 +735,20 @@ function readDraft() {
     location: s(d.location), price: toNum(d.price), qty: Math.max(0, toInt(d.qty) ?? 1), notes: s(d.notes),
     photo: typeof d.photo === 'string' && d.photo.startsWith('data:image/') ? d.photo : '',
     taste: cleanTaste(d.taste),
+    sweetness: sweetOptions(d.color).includes(d.sweetness) ? d.sweetness : '',
+    pairing: cleanPairing(d.pairing),
+    ...placeOf(d),
   };
+}
+
+// Place and slots as they will be stored: only existing places, free and valid slots, never more than bottles.
+function placeOf(d) {
+  const p = placeById(d.placeId);
+  if (!p) return { placeId: '', slots: [] };
+  const qty = Math.max(0, toInt(d.qty) ?? 1);
+  const occ = occupancy(p, state.draft?.id || d.id || null);
+  const slots = hasGrid(p) ? (d.slots || []).filter(k => validSlot(p, k) && !occ.has(k)).slice(0, qty) : [];
+  return { placeId: p.id, slots };
 }
 
 const dupCheck = debounce(() => {
@@ -622,7 +783,8 @@ async function saveWine() {
     state.wines.unshift(wine);
     try { await db.put('wines', wine); } catch (_) { toast('Speichern hat nicht geklappt.'); }
     if (d.scanned) state.game.scans = (state.game.scans || 0) + 1;
-    const xp = XP.addWine + (d.scanned ? XP.scan : 0) + (wine.location ? XP.location : 0) + (wine.drinkFrom || wine.drinkTo ? XP.window : 0);
+    if (wine.placeId) saveSettings({ lastPlace: wine.placeId });
+    const xp = XP.addWine + (d.scanned ? XP.scan : 0) + (wine.location || wine.placeId ? XP.location : 0) + (wine.drinkFrom || wine.drinkTo ? XP.window : 0);
     closeSheet('form');
     state.tab = 'keller';
     state.filter = 'alle';
@@ -643,7 +805,8 @@ async function saveWine() {
     closeSheet('form');
     render();
     refreshDetail(wine.id);
-    const xp = wine.demo ? 0 : (!orig.location && wine.location ? XP.location : 0) + (!orig.drinkFrom && !orig.drinkTo && (wine.drinkFrom || wine.drinkTo) ? XP.window : 0);
+    if (wine.placeId) saveSettings({ lastPlace: wine.placeId });
+    const xp = wine.demo ? 0 : (!orig.location && !orig.placeId && (wine.location || wine.placeId) ? XP.location : 0) + (!orig.drinkFrom && !orig.drinkTo && (wine.drinkFrom || wine.drinkTo) ? XP.window : 0);
     const res = await progress(xp);
     toast(res.total ? `Gespeichert · +${res.total} XP` : 'Gespeichert');
   }
@@ -658,6 +821,8 @@ async function mergeInto(id) {
   wine.qty += add;
   wine.updatedAt = Date.now();
   if (!wine.photo && d.data.photo) wine.photo = d.data.photo;
+  const place = placeById(wine.placeId);
+  if (hasGrid(place)) wine.slots = autoSlots(place, wine.id, wine.slots, wine.qty);
   try { await db.put('wines', wine); } catch (_) { toast('Speichern hat nicht geklappt.'); }
   if (scanned) state.game.scans = (state.game.scans || 0) + 1;
   closeSheet('form');
@@ -895,7 +1060,7 @@ function detailHtml(w) {
   const st = status(w);
   const evs = state.events.filter(e => e.wineId === w.id).sort((a, b) => b.date - a.date);
   const rows = [
-    w.location && ['📍 Lagerort', esc(w.location)],
+    w.location && [placeById(w.placeId) ? '📝 Notiz zum Ort' : '📍 Lagerort', esc(w.location)],
     w.price != null && w.price !== '' && ['💶 Preis', fmtEuro(Number(w.price))],
     w.region && ['🗺️ Region', esc(w.region)],
     w.country && ['🌍 Land', `${FLAGS[w.country] || ''} ${esc(w.country)}`],
@@ -907,10 +1072,12 @@ function detailHtml(w) {
     ...grapesOf(w).map(g => `<button class="pill pill-link" data-search="${esc(g)}" aria-label="Alle Weine mit ${esc(g)} zeigen">🍇 ${esc(g)}</button>`),
     origin ? `<button class="pill pill-link" data-search="${esc(origin)}" aria-label="Alle Weine aus ${esc(origin)} zeigen">${flagOf(w) || '📍'} ${esc(origin)}</button>` : '',
     w.color ? `<span class="pill"><i class="cdot" style="background:${COLORS[w.color].dot}"></i>${COLORS[w.color].label}</span>` : '',
+    w.sweetness ? `<span class="pill">${esc(sweetLabel(w.sweetness))}</span>` : '',
     w.demo ? '<span class="pill demo">Beispiel</span>' : '',
   ].join('');
   const np = nameParts(w);
-  const sub = [w.vintage || 'ohne Jahrgang', np.sub].filter(Boolean).join(' · ');
+  // Grapes and origin are in the chips below, so the line under the name stays short.
+  const sub = w.vintage ? `Jahrgang ${w.vintage}` : 'ohne Jahrgang';
   const photo = safePhoto(w.photo);
   return `<div class="sheet-body">
     <div class="hero ${photo ? 'has-photo' : tileClass(w)}">${photo ? `<img src="${photo}" alt="Etikett">` : `<div class="hero-bottle">${bottleSvg(w, 188)}</div>`}
@@ -918,14 +1085,17 @@ function detailHtml(w) {
       <button class="icon-btn" data-action="close-sheet" aria-label="Schließen">${icon('x')}</button></div>
     <div class="detail-title">${np.kicker ? `<span class="kicker">${esc(np.kicker)}</span>` : ''}<h2>${esc(np.title)}</h2><p>${esc(sub)}</p></div>
     ${tags ? `<div class="tags">${tags}</div>` : ''}
-    <div class="qty-row">
-      <div class="stepper"><button type="button" data-action="qty" data-id="${w.id}" data-d="-1" aria-label="Eine Flasche weniger">${icon('minus')}</button><output>${w.qty}</output><button type="button" data-action="qty" data-id="${w.id}" data-d="1" aria-label="Eine Flasche mehr">${icon('plus')}</button></div>
-      <button class="btn primary" data-action="open-bottle" data-id="${w.id}"${w.qty > 0 ? '' : ' disabled'}>🍷 Flasche öffnen</button>
+    <div class="stock-row">
+      <div class="stock"><b>${w.qty}</b><span>${w.qty === 1 ? 'Flasche' : 'Flaschen'} im Keller</span></div>
+      <button class="btn ghost small" data-action="qty" data-id="${w.id}" data-d="1">${icon('plus')} 1 dazugekauft</button>
     </div>
+    ${w.qty > 0 ? `<button class="btn primary block open-btn" data-action="open-bottle" data-id="${w.id}">🍷 Flasche öffnen</button>` : '<p class="muted center small" style="margin:4px 0 12px">Ausgetrunken. Mit „1 dazugekauft“ kommt er zurück in den Keller.</p>'}
+    ${whereCard(w)}
     ${w.drinkFrom || w.drinkTo
       ? `<div class="tw"><div class="tw-top"><b>Trinkfenster</b><span class="pill st st-${st}">${STATUS[st].label}</span></div>${windowBar(w)}</div>`
       : `<button class="tw add" data-action="edit" data-id="${w.id}">${icon('plus')} Trinkfenster eintragen</button>`}
     ${tasteCard(w)}
+    ${pairingCard(w)}
     <div class="ext-links">
       <a class="ext" href="${esc(vivinoUrl(w))}" target="_blank" rel="noopener">${icon('star')}<span>Bewertungen<small>auf Vivino</small></span></a>
       <a class="ext" href="${esc(wineSearcherUrl(w))}" target="_blank" rel="noopener">${icon('tag')}<span>Preise vergleichen<small>auf Wine-Searcher</small></span></a>
@@ -953,9 +1123,61 @@ function tasteCard(w) {
   return `<div class="taste"><div class="taste-top"><b>Geschmack</b><small>${source}</small></div>${rows}</div>`;
 }
 
+// Dishes for this wine; a tap asks the sommelier with that dish.
+function pairingCard(w) {
+  const p = pairingOf(w);
+  if (!p.dishes.length) return '';
+  return `<div class="pairing"><div class="taste-top"><b>Passt zu</b><small>${p.source === 'ai' ? 'Vorschlag der KI' : `typisch für ${esc(p.label)}`}</small></div>
+    <div class="pair-chips">${p.dishes.map(d => `<button class="pair-chip" data-foodgo="${esc(d)}" aria-label="Sommelier fragen: ${esc(d)}">🍽️ ${esc(d)}</button>`).join('')}</div></div>`;
+}
+
+// Short, calm animation when a bottle is opened: a glass fills with the wine's colour.
+function pourAnim(color) {
+  if (!effectsOn()) return;
+  const fill = COLORS[color]?.dot || '#8e1b3a';
+  const el = document.createElement('div');
+  el.className = 'pour';
+  el.setAttribute('aria-hidden', 'true');
+  el.innerHTML = `<svg viewBox="0 0 120 150" width="96" height="120">
+    <defs><clipPath id="pour-clip"><path d="M32 18h56c0 42-8 64-28 68-20-4-28-26-28-68z"/></clipPath></defs>
+    <g clip-path="url(#pour-clip)"><rect class="pour-wine" x="20" y="18" width="80" height="70" fill="${fill}"/></g>
+    <path d="M32 18h56c0 42-8 64-28 68-20-4-28-26-28-68z" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linejoin="round"/>
+    <path d="M60 86v38M42 126h36" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" fill="none"/>
+  </svg><span>Prost!</span>`;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 1700);
+}
+
+// "Wo liegt er?": the place, the slot names and a small plan with this wine's bottles lit up.
+function whereCard(w) {
+  const p = placeById(w.placeId);
+  if (!p) {
+    return state.places.length && w.qty > 0
+      ? `<button class="tw add" data-action="open-placement" data-id="${w.id}">${icon('pin')} Ins Lager legen</button>`
+      : '';
+  }
+  const slots = (w.slots || []).filter(k => validSlot(p, k));
+  const label = slots.length ? `Platz ${slots.map(slotLabel).join(', ')}` : (hasGrid(p) ? 'Noch ohne festen Platz' : plural(w.qty, 'Flasche', 'Flaschen'));
+  const others = state.places.filter(o => o.id !== p.id);
+  return `<div class="where">
+    <div class="where-top"><span class="place-emoji">${kindOf(p).emoji}</span><span class="place-text"><b>${esc(p.name)}</b><small>${label}</small></span><button class="link" data-action="open-placement" data-id="${w.id}">Ändern</button></div>
+    ${hasGrid(p) && w.qty > 0 ? rackHtml(p, { mode: 'mine', wineId: w.id, size: 'rack-mini' }) : ''}
+    ${others.length && w.qty > 0 ? `<div class="move-row"><span>Umziehen</span>${others.map(o => `<button class="chip" data-moveto="${o.id}" data-id="${w.id}">${kindOf(o).emoji} ${esc(o.name)}</button>`).join('')}</div>` : ''}
+  </div>`;
+}
+
 function evHtml(e) {
   const stars = e.rating ? `<span class="ev-stars" aria-label="${e.rating} von 5 Sternen">${'★'.repeat(e.rating)}${'☆'.repeat(5 - e.rating)}</span>` : '';
-  return `<div class="ev"><div class="ev-top"><span>${fmtDate(e.date)}</span>${stars}${e.inWindow ? '<span class="pill st st-jetzt">im Trinkfenster</span>' : ''}</div>${e.note ? `<p>${esc(e.note)}</p>` : ''}</div>`;
+  const count = e.count > 1 ? `<span>${e.count} Flaschen</span>` : '';
+  return `<div class="ev"><div class="ev-top"><span>${fmtDate(e.date)}</span>${count}${stars}${e.inWindow ? '<span class="pill st st-jetzt">im Trinkfenster</span>' : ''}</div>${e.note ? `<p>${esc(e.note)}</p>` : ''}</div>`;
+}
+
+// Bottles that leave the cellar free their slots; new bottles get the next free slots.
+function syncSlots(w) {
+  const p = placeById(w.placeId);
+  if (!hasGrid(p)) { w.slots = []; return; }
+  const valid = (w.slots || []).filter(k => validSlot(p, k));
+  w.slots = valid.length > w.qty ? valid.slice(0, w.qty) : valid;
 }
 
 async function changeQty(id, delta) {
@@ -965,6 +1187,9 @@ async function changeQty(id, delta) {
   if (next === w.qty) return;
   w.qty = next;
   w.updatedAt = Date.now();
+  const p = placeById(w.placeId);
+  if (delta > 0 && hasGrid(p)) w.slots = autoSlots(p, w.id, w.slots, w.qty);
+  else syncSlots(w);
   try { await db.put('wines', w); } catch (_) { toast('Speichern hat nicht geklappt.'); }
   buzz(8);
   render();
@@ -978,7 +1203,7 @@ function openBottle(id) {
   if (!w || w.qty <= 0) return;
   const st = status(w);
   const inWindow = st === 'jetzt' || st === 'bald';
-  state.drink = { id, rating: 0, inWindow };
+  state.drink = { id, rating: 0, inWindow, count: 1 };
   let hint = '';
   if (inWindow) hint = '<div class="callout good">🎯 <span><b>Perfektes Timing!</b> Der Wein ist gerade im Trinkfenster.</span></div>';
   else if (st === 'lagern') hint = '<div class="callout warn"><span>Eigentlich ist er noch jung. Trotzdem gut, wenn er schmeckt!</span></div>';
@@ -987,6 +1212,7 @@ function openBottle(id) {
     <div class="sheet-head"><h2>Prost! 🥂</h2><button class="icon-btn flat" data-action="close-sheet" aria-label="Schließen">${icon('x')}</button></div>
     <div class="sheet-body">
       <p class="muted center" style="margin:0 0 12px">${esc(wineTitle(w))}${w.vintage ? ` · ${w.vintage}` : ''}</p>
+      ${w.qty > 1 ? `<div class="drink-count"><span>Wie viele Flaschen?</span><div class="stepper"><button type="button" data-dcount="-1" aria-label="Eine weniger">${icon('minus')}</button><output id="drink-n">1</output><button type="button" data-dcount="1" aria-label="Eine mehr">${icon('plus')}</button></div><small>von ${w.qty}</small></div>` : ''}
       ${hint}
       <div class="stars" role="group" aria-label="Bewertung">${[1, 2, 3, 4, 5].map(n => `<button type="button" data-star="${n}" aria-label="${n} von 5 Sternen">★</button>`).join('')}</div>
       <label class="field"><span>Wie war er?</span><textarea id="drink-note" rows="3" placeholder="Duft, Geschmack, zu welchem Essen …"></textarea></label>
@@ -1001,10 +1227,12 @@ async function confirmDrink(skip) {
   if (!w) return;
   const note = skip ? '' : ($('#drink-note')?.value || '').trim();
   const rating = skip ? 0 : dr.rating;
-  const before = { ...w };
-  w.qty = Math.max(0, w.qty - 1);
+  const before = { ...w, slots: [...(w.slots || [])] };
+  const count = Math.max(1, Math.min(w.qty, dr.count || 1));
+  w.qty = Math.max(0, w.qty - count);
   w.updatedAt = Date.now();
-  const ev = { id: uid(), wineId: w.id, type: 'open', date: Date.now(), rating, note, inWindow: dr.inWindow };
+  syncSlots(w);
+  const ev = { id: uid(), wineId: w.id, type: 'open', date: Date.now(), rating, note, inWindow: dr.inWindow, count };
   state.events.push(ev);
   try { await Promise.all([db.put('wines', w), db.put('events', ev)]); } catch (_) { toast('Speichern hat nicht geklappt.'); }
   state.drink = null;
@@ -1014,9 +1242,12 @@ async function confirmDrink(skip) {
   // Timing points only once per wine, so the game never rewards opening more bottles.
   const firstTiming = dr.inWindow && !state.events.some(e => e.wineId === w.id && e.inWindow && e.id !== ev.id);
   const base = w.demo ? 0 : (note ? XP.note : 0) + (rating ? XP.rating : 0) + (firstTiming ? XP.timing : 0);
-  if (dr.inWindow || note) celebrate('small');
+  pourAnim(w.color);
+  if (dr.inWindow) setTimeout(() => celebrate('small'), 900);
   const res = await progress(base);
-  const left = w.qty ? `Noch ${plural(w.qty, 'Flasche', 'Flaschen')} übrig` : 'Das war die letzte Flasche';
+  const left = w.qty
+    ? `${count > 1 ? `${count} geöffnet · ` : ''}Noch ${plural(w.qty, 'Flasche', 'Flaschen')} übrig`
+    : (count > 1 ? `${count} geöffnet, das waren die letzten` : 'Das war die letzte Flasche');
   toast(`${left}${res.total ? ` · +${res.total} XP` : ''}`, { action: 'Rückgängig', onAction: () => undoDrink(before, ev, base) });
 }
 
@@ -1030,6 +1261,158 @@ async function undoDrink(before, ev, xp) {
   render();
   refreshDetail(w.id);
   toast('Rückgängig gemacht');
+}
+
+/* ---------- storage sheets ---------- */
+// "Wo liegt er?": pick the place and tap the slots. Changes are saved right away.
+function openPlacement(id) {
+  const w = byId(id);
+  if (!w) return;
+  state.placing = id;
+  openSheet('place', placementHtml(w), { onClose: () => { state.placing = null; } });
+}
+
+function placementHtml(w) {
+  const p = placeById(w.placeId);
+  return `<div class="grab"></div>
+    <div class="sheet-head"><h2>Wo liegt er?</h2><button class="icon-btn flat" data-action="close-sheet" aria-label="Schließen">${icon('x')}</button></div>
+    <div class="sheet-body">
+      <p class="muted" style="margin:0 0 12px">${esc(nameParts(w).title)}${w.vintage ? ` · ${w.vintage}` : ''} · ${plural(w.qty, 'Flasche', 'Flaschen')}</p>
+      <div class="seg" role="radiogroup" aria-label="Lager" style="margin-bottom:14px">${state.places.map(pl => `<button type="button" class="seg-btn" role="radio" data-pplace="${pl.id}" aria-checked="${w.placeId === pl.id}">${kindOf(pl).emoji} ${esc(pl.name)}</button>`).join('')}<button type="button" class="seg-btn add" data-action="new-place" aria-label="Neues Lager anlegen">${icon('plus')}</button></div>
+      ${hasGrid(p) ? `<p class="small muted" style="margin:0 0 10px">Tippe auf die Plätze, wo die Flaschen liegen. Gold = dieser Wein.</p>
+        ${rackHtml(p, { mode: 'pick', wineId: w.id, picked: w.slots || [], color: w.color })}
+        <div class="slot-tools"><button type="button" class="link" data-action="auto-slots">Automatisch</button><button type="button" class="link" data-action="clear-slots">Ohne festen Platz</button></div>`
+      : p ? '<p class="small muted">Hier gibt es keine festen Plätze, die Flaschen werden einfach gezählt.</p>' : ''}
+    </div>
+    <div class="sheet-foot"><button class="btn primary block" data-action="close-sheet">Fertig</button></div>`;
+}
+
+async function updatePlacedWine(w) {
+  w.updatedAt = Date.now();
+  try { await db.put('wines', w); } catch (_) { toast('Speichern hat nicht geklappt.'); }
+  if (w.placeId) saveSettings({ lastPlace: w.placeId });
+  const sheet = sheetEl('place');
+  if (sheet) sheet.querySelector('.sheet').innerHTML = placementHtml(w);
+  refreshDetail(w.id);
+  render();
+}
+
+// A tapped empty slot: scan a new bottle into it, or move a wine without a slot there.
+function openSlotSheet(placeId, key) {
+  const p = placeById(placeId);
+  if (!p) return;
+  state.slotTarget = { placeId, key };
+  const waiting = inStock().filter(w => (w.placeId === placeId && (w.slots || []).length < w.qty) || !placeById(w.placeId));
+  openSheet('slot', `<div class="grab"></div>
+    <div class="sheet-head"><h2>${kindOf(p).emoji} Platz ${slotLabel(key)} ist frei</h2><button class="icon-btn flat" data-action="close-sheet" aria-label="Schließen">${icon('x')}</button></div>
+    <div class="sheet-body">
+      <button class="btn primary block" data-action="slot-scan">${icon('camera')} Etikett scannen und hierher legen</button>
+      ${waiting.length ? `<h3 class="section-title">Oder einen Wein ohne Platz <small>${waiting.length}</small></h3>
+        <div class="list">${waiting.slice(0, 30).map(w => `<button class="card" data-slotwine="${w.id}">${thumb(w)}<span class="meta">${nameParts(w).kicker ? `<span class="kicker">${esc(nameParts(w).kicker)}</span>` : ''}<span class="producer">${esc(nameParts(w).title)}</span><span class="line2">${w.vintage || 'o. J.'} · ${plural(w.qty, 'Flasche', 'Flaschen')}</span></span></button>`).join('')}</div>` : ''}
+    </div>`);
+}
+
+async function putWineInSlot(id) {
+  const t = state.slotTarget;
+  const w = byId(id);
+  const p = t && placeById(t.placeId);
+  if (!w || !p) return;
+  if (w.placeId !== p.id) { w.placeId = p.id; w.slots = []; }
+  w.slots = [...(w.slots || []).filter(k => validSlot(p, k)), t.key];
+  if (w.slots.length > w.qty) w.qty = w.slots.length;
+  closeSheet('slot');
+  await updatePlacedWine(w);
+  buzz(15);
+  toast(`${nameParts(w).title} liegt jetzt auf ${slotLabel(t.key)}`);
+}
+
+// New or edited place: type, name and (for racks) rows and slots per row.
+function openPlaceEditor(id = null, kind = 'kuehlschrank', fromSheet = '') {
+  const p = placeById(id);
+  const k = PLACE_KINDS[p ? p.kind : kind] || PLACE_KINDS.kuehlschrank;
+  state.placeDraft = p
+    ? { ...p, isNew: false, nameTouched: true, fromSheet }
+    : { id: uid(), name: k.label, kind: PLACE_KINDS[kind] ? kind : 'kuehlschrank', rows: k.rows, cols: k.cols, isNew: true, nameTouched: false, fromSheet };
+  openSheet('place-edit', placeEditorHtml());
+}
+
+function placeEditorHtml() {
+  const d = state.placeDraft;
+  const grid = (PLACE_KINDS[d.kind] || {}).rows > 0;
+  const preview = { ...d, rows: grid ? d.rows : 0, cols: grid ? d.cols : 0 };
+  const step = (key, v, label) => `<div class="field"><span>${label}</span><div class="stepper"><button type="button" data-pstep="${key}" data-d="-1" aria-label="${label}: weniger">${icon('minus')}</button><output id="ps-${key}">${v}</output><button type="button" data-pstep="${key}" data-d="1" aria-label="${label}: mehr">${icon('plus')}</button></div></div>`;
+  return `<div class="grab"></div>
+    <div class="sheet-head"><h2>${d.isNew ? 'Neues Lager' : 'Lager bearbeiten'}</h2><button class="icon-btn flat" data-action="close-sheet" aria-label="Schließen">${icon('x')}</button></div>
+    <div class="sheet-body">
+      <div class="kind-row">${Object.entries(PLACE_KINDS).map(([key, k]) => `<button type="button" class="kind-chip" data-kind="${key}" aria-pressed="${d.kind === key}"><span>${k.emoji}</span>${k.label}</button>`).join('')}</div>
+      <label class="field"><span>Name</span><input id="pl-name" type="text" value="${esc(d.name)}" maxlength="40" autocomplete="off"></label>
+      ${grid ? `<div class="row2">${step('rows', d.rows, 'Reihen')}${step('cols', d.cols, 'Plätze pro Reihe')}</div>
+        <div id="pl-preview">${rackHtml(preview, { mode: 'preview', size: 'rack-compact' })}</div>`
+      : `<p class="small muted">${esc(PLACE_KINDS[d.kind].desc)}. Die Flaschen werden einfach gezählt.</p>`}
+    </div>
+    <div class="sheet-foot">${d.isNew ? '' : `<button class="btn ghost danger" data-action="place-delete" aria-label="Lager löschen">${icon('trash')}</button>`}<button class="btn primary" data-action="place-save">${d.isNew ? 'Lager anlegen' : 'Speichern'}</button></div>`;
+}
+
+async function savePlace() {
+  const d = state.placeDraft;
+  if (!d) return;
+  const grid = (PLACE_KINDS[d.kind] || {}).rows > 0;
+  const place = {
+    id: d.id, kind: d.kind, name: (d.name || '').trim().slice(0, 40) || PLACE_KINDS[d.kind].label,
+    rows: grid ? Math.max(1, Math.min(20, d.rows)) : 0, cols: grid ? Math.max(1, Math.min(12, d.cols)) : 0,
+    createdAt: d.createdAt || Date.now(), demo: !!d.demo,
+  };
+  const idx = state.places.findIndex(p => p.id === place.id);
+  if (idx >= 0) state.places[idx] = place; else state.places.push(place);
+  // A smaller rack drops slots that no longer exist.
+  const touched = state.wines.filter(w => w.placeId === place.id);
+  touched.forEach(syncSlots);
+  await savePlaces();
+  try { await db.putMany('wines', touched); } catch (_) { /* ignore */ }
+  const from = d.fromSheet;
+  state.placeDraft = null;
+  closeSheet('place-edit');
+  if (d.isNew) {
+    saveSettings({ lastPlace: place.id });
+    // Coming from the wine form or "Wo liegt er?": put the wine straight into the new place.
+    if (from === 'form' && state.draft) {
+      state.draft.data.placeId = place.id;
+      state.draft.data.slots = autoSlots(place, state.draft.id, [], Math.max(1, toInt(state.draft.data.qty) || 1));
+      const body = sheetEl('form')?.querySelector('.sheet-body');
+      const top = body ? body.scrollTop : 0;
+      openSheet('form', formHtml());
+      const next = sheetEl('form')?.querySelector('.sheet-body');
+      if (next) next.scrollTop = top;
+    } else if (from === 'place' && state.placing) {
+      const w = byId(state.placing);
+      if (w) { w.placeId = place.id; w.slots = autoSlots(place, w.id, [], w.qty); await updatePlacedWine(w); }
+    }
+  }
+  render();
+  toast(d.isNew ? `${place.name} angelegt` : 'Lager gespeichert');
+}
+
+function deletePlace() {
+  const d = state.placeDraft;
+  const p = d && placeById(d.id);
+  if (!p) return;
+  const n = state.wines.filter(w => w.placeId === p.id && w.qty > 0).length;
+  confirmSheet({
+    emoji: '🗄️', title: `${p.name} löschen?`,
+    text: n ? `Die ${plural(n, 'Wein bleibt', 'Weine bleiben')} im Keller, nur ohne Lager.` : 'Das Lager ist leer.',
+    ok: 'Löschen', danger: true,
+    onOk: async () => {
+      state.places = state.places.filter(x => x.id !== p.id);
+      const touched = state.wines.filter(w => w.placeId === p.id);
+      touched.forEach(w => { w.placeId = ''; w.slots = []; });
+      if (settings().lastPlace === p.id) saveSettings({ lastPlace: '' });
+      await savePlaces();
+      try { await db.putMany('wines', touched); } catch (_) { /* ignore */ }
+      closeSheet('place-edit');
+      render();
+      toast('Lager gelöscht');
+    },
+  });
 }
 
 /* ---------- confirm & delete ---------- */
@@ -1197,6 +1580,15 @@ function viewMehr() {
       <p class="small muted">Gratis heißt: 50 Anfragen pro Tag. Wer bei OpenRouter einmal 10 $ Guthaben kauft, bekommt 1.000 pro Tag. Der Schlüssel bleibt nur auf diesem Gerät.</p>
     </section>
     <section class="panel">
+      <h2 class="panel-title">${icon('rack')} Lager</h2>
+      <p class="muted">Weinkühlschrank, Kellerregal, Kiste: Leg an, wo deine Flaschen liegen. Mit Plan siehst du jeden Platz.</p>
+      ${state.places.length ? `<div class="place-list">${state.places.map(p => `<button class="place-row" data-editplace="${p.id}"><span class="place-emoji">${kindOf(p).emoji}</span><span class="place-text"><b>${esc(p.name)}</b><small>${hasGrid(p) ? `${p.rows} Reihen × ${p.cols} Plätze` : kindOf(p).label}</small></span>${icon('edit')}</button>`).join('')}</div>` : ''}
+      <div class="row-btns"><button class="btn small" data-action="new-place">${icon('plus')} Lager anlegen</button></div>
+    </section>
+    <section class="panel">
+      <label class="switch"><span><b>Mehr Weinarten</b><small>Orange, Perlwein, Likörwein und die Geschmacksrichtung: trocken, halbtrocken, lieblich, süß, bei Sekt brut und Co.</small></span><input type="checkbox" id="more-types"${s.moreTypes ? ' checked' : ''}></label>
+    </section>
+    <section class="panel">
       <label class="switch"><span><b>Konfetti und Effekte</b><small>Feiern beim Speichern und bei Erfolgen</small></span><input type="checkbox" id="effects"${s.effects !== false ? ' checked' : ''}></label>
     </section>
     <section class="panel">
@@ -1279,7 +1671,21 @@ function cleanWine(w) {
     price: n(w.price), qty: Math.max(0, Math.round(n(w.qty) || 0)), notes: String(w.notes ?? '').slice(0, 4000),
     photo: typeof w.photo === 'string' && w.photo.startsWith('data:image/') ? w.photo : '',
     scanned: !!w.scanned, aiModel: s(w.aiModel), demo: !!w.demo, taste: cleanTaste(w.taste),
+    sweetness: s(w.sweetness).slice(0, 20), placeId: s(w.placeId).slice(0, 60), pairing: cleanPairing(w.pairing),
+    slots: (Array.isArray(w.slots) ? w.slots : []).map(String).filter(k => /^\d{1,2}-\d{1,2}$/.test(k)).slice(0, 240),
   };
+}
+
+function cleanPlaces(list) {
+  return (Array.isArray(list) ? list : []).filter(p => p && p.id && PLACE_KINDS[p.kind]).slice(0, 30).map(p => {
+    const grid = PLACE_KINDS[p.kind].rows > 0;
+    return {
+      id: String(p.id).slice(0, 60), kind: p.kind, name: String(p.name || PLACE_KINDS[p.kind].label).slice(0, 40),
+      rows: grid ? Math.max(1, Math.min(20, Math.round(Number(p.rows) || 1))) : 0,
+      cols: grid ? Math.max(1, Math.min(12, Math.round(Number(p.cols) || 1))) : 0,
+      createdAt: Number(p.createdAt) || Date.now(), demo: !!p.demo,
+    };
+  });
 }
 
 async function restore(file) {
@@ -1291,8 +1697,10 @@ async function restore(file) {
     events: (Array.isArray(data.events) ? data.events : []).filter(e => e && e.id && e.wineId).map(e => ({
       id: String(e.id), wineId: String(e.wineId), type: 'open', date: Number(e.date) || Date.now(),
       rating: Math.max(0, Math.min(5, Math.round(Number(e.rating) || 0))), note: String(e.note ?? '').slice(0, 4000), inWindow: !!e.inWindow,
+      count: Math.max(1, Math.min(99, Math.round(Number(e.count) || 1))),
     })),
-    meta: (Array.isArray(data.meta) ? data.meta : []).filter(m => m && m.key === 'game'),
+    meta: (Array.isArray(data.meta) ? data.meta : []).filter(m => m && (m.key === 'game' || m.key === 'places'))
+      .map(m => (m.key === 'places' ? { key: 'places', value: cleanPlaces(m.value) } : m)),
   };
   const apply = async () => {
     try {
@@ -1310,56 +1718,232 @@ async function restore(file) {
   }
 }
 
+// Sample places: index 0 fridge (6 x 6), 1 cellar rack (5 x 8), 2 box without slots.
+const DEMO_PLACES = [
+  ['Weinkühlschrank', 'kuehlschrank', 6, 6],
+  ['Kellerregal', 'keller', 5, 8],
+  ['Kiste im Abstellraum', 'kiste', 0, 0],
+];
+// producer, name, grape, vintage, type, sweetness, region, country, from, to, bottles, place index, first slot (row-col), price
 const DEMO = [
-  ['Weingut Sonnleiten', 'Ried Kellerberg', 'Grüner Veltliner', 2022, 'weiss', 'Wachau', 'Österreich', 2024, 2030, 3, 'Regal 1, Fach 2', 24],
-  ['Weingut Hofstätter', '', 'Blaufränkisch', 2019, 'rot', 'Mittelburgenland', 'Österreich', 2023, 2031, 2, 'Regal 2, Fach 1', 32],
-  ['Domaine des Trois Chênes', 'Chablis Premier Cru', 'Chardonnay', 2020, 'weiss', 'Burgund', 'Frankreich', 2022, 2027, 1, 'Regal 1, Fach 4', 38],
-  ['Tenuta Colle Alto', 'Chianti Classico Riserva', 'Sangiovese', 2018, 'rot', 'Toskana', 'Italien', 2022, 2030, 2, 'Regal 3', 29],
-  ['Sektkellerei Morgentau', 'Brut Reserve', 'Chardonnay, Pinot Noir', null, 'schaum', 'Niederösterreich', 'Österreich', null, null, 4, 'Kühlschrank', 19],
-  ['Bodega Las Piedras', 'Gran Reserva', 'Malbec', 2023, 'rot', 'Mendoza', 'Argentinien', 2027, 2035, 6, 'Regal 4', 21],
-  ['Weingut Kranzl', '', 'Zweigelt', 2017, 'rot', 'Carnuntum', 'Österreich', 2019, 2024, 1, 'Regal 2, Fach 3', 14],
+  ['Weingut Sonnleiten', 'Ried Kellerberg', 'Grüner Veltliner', 2022, 'weiss', 'trocken', 'Wachau', 'Österreich', 2024, 2030, 3, 0, '1-1', 24],
+  ['Weingut Hofstätter', '', 'Blaufränkisch', 2019, 'rot', 'trocken', 'Mittelburgenland', 'Österreich', 2023, 2031, 2, 1, '1-1', 32],
+  ['Domaine des Trois Chênes', 'Chablis Premier Cru', 'Chardonnay', 2020, 'weiss', 'trocken', 'Burgund', 'Frankreich', 2022, 2027, 1, 0, '1-4', 38],
+  ['Tenuta Colle Alto', 'Chianti Classico Riserva', 'Sangiovese', 2018, 'rot', 'trocken', 'Toskana', 'Italien', 2022, 2030, 2, 1, '1-3', 29],
+  ['Sektkellerei Morgentau', 'Brut Reserve', 'Chardonnay, Pinot Noir', null, 'schaum', 'brut', 'Niederösterreich', 'Österreich', null, null, 4, 0, '2-1', 19],
+  ['Bodega Las Piedras', 'Gran Reserva', 'Malbec', 2023, 'rot', 'trocken', 'Mendoza', 'Argentinien', 2027, 2035, 6, 2, '', 21],
+  ['Weingut Kranzl', '', 'Zweigelt', 2017, 'rot', 'trocken', 'Carnuntum', 'Österreich', 2019, 2024, 1, 1, '2-1', 14],
 ];
 
 async function loadDemo() {
   const now = Date.now();
-  const wines = DEMO.map(([producer, name, grape, vintage, color, region, country, drinkFrom, drinkTo, qty, location, price], i) => ({
-    id: uid(), createdAt: now - i * 60000, updatedAt: now, producer, name, grape, vintage, color, region, country,
-    drinkFrom, drinkTo, qty, location, price, notes: '', photo: '', scanned: false, aiModel: '', demo: true,
-  }));
+  const places = DEMO_PLACES.map(([name, kind, rows, cols], i) => ({ id: uid(), name, kind, rows, cols, createdAt: now + i, demo: true }));
+  const wines = DEMO.map(([producer, name, grape, vintage, color, sweetness, region, country, drinkFrom, drinkTo, qty, pi, first, price], i) => {
+    const place = places[pi];
+    let slots = [];
+    if (first && hasGrid(place)) {
+      const [r, c] = first.split('-').map(Number);
+      slots = Array.from({ length: qty }, (_, k) => `${r}-${c + k}`).filter(k => validSlot(place, k));
+    }
+    return {
+      id: uid(), createdAt: now - i * 60000, updatedAt: now, producer, name, grape, vintage, color, sweetness, region, country,
+      drinkFrom, drinkTo, qty, location: '', price, notes: '', photo: '', scanned: false, aiModel: '', demo: true,
+      placeId: place.id, slots,
+    };
+  });
+  state.places.push(...places);
   state.wines.push(...wines);
-  try { await db.putMany('wines', wines); } catch (_) { /* ignore */ }
+  try { await db.putMany('wines', wines); await savePlaces(); } catch (_) { /* ignore */ }
   state.tab = 'keller';
   render();
   celebrate('small');
-  toast('7 Beispielweine geladen. Sie zählen nicht für Erfolge.', { ms: 5200 });
+  toast('7 Beispielweine und 3 Lager geladen. Sie zählen nicht für Erfolge.', { ms: 5200 });
 }
 
 async function removeDemo() {
   const ids = state.wines.filter(w => w.demo).map(w => w.id);
   const evIds = state.events.filter(e => ids.includes(e.wineId)).map(e => e.id);
+  const demoPlaces = state.places.filter(p => p.demo).map(p => p.id);
   state.wines = state.wines.filter(w => !w.demo);
   state.events = state.events.filter(e => !ids.includes(e.wineId));
-  try { await db.delMany('wines', ids); await db.delMany('events', evIds); } catch (_) { /* ignore */ }
+  state.places = state.places.filter(p => !p.demo);
+  const moved = state.wines.filter(w => demoPlaces.includes(w.placeId));
+  moved.forEach(w => { w.placeId = ''; w.slots = []; });
+  if (demoPlaces.includes(settings().lastPlace)) saveSettings({ lastPlace: '' });
+  try { await db.delMany('wines', ids); await db.delMany('events', evIds); await db.putMany('wines', moved); await savePlaces(); } catch (_) { /* ignore */ }
   render();
-  toast('Beispielweine entfernt');
+  toast('Beispielweine und Beispiel-Lager entfernt');
 }
 
 async function wipe() {
   try { await db.clearAll(); } catch (_) { /* ignore */ }
   state.wines = [];
   state.events = [];
+  state.places = [];
   state.game = { xp: 0, unlocked: {}, scans: 0, sommelier: 0 };
   state.somm = null;
+  saveSettings({ lastPlace: '' });
   render();
   toast('Keller geleert. Neuer Anfang!');
 }
 
 /* ---------- events ---------- */
+// Clicks for views, places, slots, sweetness and the bottle count. Returns true when handled.
+function onStorageClick(t) {
+  const ds = t.dataset;
+  if (ds.view) {
+    if (!VIEWS.includes(ds.view) || ds.view === state.view) return true;
+    state.view = ds.view;
+    try { localStorage.setItem('wk.view', state.view); } catch (_) { /* ignore */ }
+    $$('[data-view]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.view === state.view)));
+    buzz(6);
+    if (document.startViewTransition && effectsOn()) {
+      const vt = document.startViewTransition(renderList);
+      [vt.ready, vt.finished, vt.updateCallbackDone].forEach(p => p?.catch(() => {}));
+    } else renderList();
+    return true;
+  }
+  if (ds.sweet && state.draft) {
+    const d = state.draft.data;
+    d.sweetness = d.sweetness === ds.sweet ? '' : ds.sweet;
+    state.draft.touched.add('sweetness');
+    $$('[data-sweet]').forEach(b => b.setAttribute('aria-checked', String(b.dataset.sweet === d.sweetness)));
+    buzz(6);
+    return true;
+  }
+  if (ds.dcount && state.drink) {
+    const w = byId(state.drink.id);
+    state.drink.count = Math.max(1, Math.min(w ? w.qty : 1, (state.drink.count || 1) + Number(ds.dcount)));
+    const out = $('#drink-n');
+    if (out) out.textContent = state.drink.count;
+    buzz(6);
+    return true;
+  }
+  if (ds.place && state.draft) {
+    // Form: tap a place; racks get free slots straight away, tap again to remove the place.
+    const d = state.draft.data;
+    const p = placeById(ds.place);
+    if (!p || d.placeId === p.id) { d.placeId = ''; d.slots = []; }
+    else { d.placeId = p.id; d.slots = autoSlots(p, state.draft.id, [], Math.max(1, toInt(d.qty) || 1)); }
+    $$('[data-place]').forEach(b => b.setAttribute('aria-checked', String(b.dataset.place === d.placeId)));
+    refreshFormSlots();
+    buzz(6);
+    return true;
+  }
+  if (ds.pplace && state.placing) {
+    const w = byId(state.placing);
+    const p = placeById(ds.pplace);
+    if (!w) return true;
+    if (!p || w.placeId === p.id) { w.placeId = ''; w.slots = []; }
+    else { w.placeId = p.id; w.slots = autoSlots(p, w.id, [], w.qty); }
+    buzz(6);
+    updatePlacedWine(w);
+    return true;
+  }
+  if (ds.slottoggle) {
+    const inForm = !!t.closest('[data-sheet="form"]');
+    const target = inForm ? state.draft?.data : byId(state.placing);
+    if (!target) return true;
+    const slots = [...(target.slots || [])];
+    const i = slots.indexOf(ds.slottoggle);
+    if (i >= 0) slots.splice(i, 1); else slots.push(ds.slottoggle);
+    target.slots = slots;
+    // Placing more bottles than counted means there are more bottles.
+    const qty = toInt(target.qty) || 0;
+    if (slots.length > qty) {
+      target.qty = slots.length;
+      if (inForm) { const out = $('#s-qty'); if (out) out.textContent = target.qty; }
+    }
+    buzz(6);
+    if (inForm) refreshFormSlots(); else updatePlacedWine(target);
+    return true;
+  }
+  if (ds.slotfree) {
+    const [placeId, key] = ds.slotfree.split('|');
+    openSlotSheet(placeId, key);
+    return true;
+  }
+  if (ds.slotwine) { putWineInSlot(ds.slotwine); return true; }
+  if (ds.foodgo) {
+    state.sommFood = ds.foodgo;
+    goTab('sommelier', () => askSomm());
+    return true;
+  }
+  if (ds.moveto) {
+    // One tap moves all bottles of the wine; racks get the next free slots.
+    const w = byId(ds.id);
+    const p = placeById(ds.moveto);
+    if (!w || !p) return true;
+    w.placeId = p.id;
+    w.slots = autoSlots(p, w.id, [], w.qty);
+    buzz(12);
+    updatePlacedWine(w);
+    toast(`Liegt jetzt: ${p.name}${w.slots.length ? ` · ${w.slots.map(slotLabel).join(', ')}` : ''}`);
+    return true;
+  }
+  if (ds.editplace) { openPlaceEditor(ds.editplace); return true; }
+  if (ds.newplace) { openPlaceEditor(null, ds.newplace); return true; }
+  if (ds.kind && state.placeDraft) {
+    const d = state.placeDraft;
+    const k = PLACE_KINDS[ds.kind];
+    if (!k) return true;
+    d.kind = ds.kind;
+    // New places take the template size until the size was changed by hand.
+    if (k.rows && (!d.sizeTouched || !d.rows || !d.cols) && d.isNew) { d.rows = k.rows; d.cols = k.cols; }
+    else if (k.rows && (!d.rows || !d.cols)) { d.rows = k.rows; d.cols = k.cols; }
+    if (!d.nameTouched) d.name = k.label;
+    openSheet('place-edit', placeEditorHtml());
+    buzz(6);
+    return true;
+  }
+  if (ds.pstep && state.placeDraft) {
+    const d = state.placeDraft;
+    const max = ds.pstep === 'rows' ? 20 : 12;
+    d[ds.pstep] = Math.max(1, Math.min(max, (d[ds.pstep] || 1) + Number(t.dataset.d)));
+    d.sizeTouched = true;
+    const out = $(`#ps-${ds.pstep}`);
+    if (out) out.textContent = d[ds.pstep];
+    const pv = $('#pl-preview');
+    if (pv) pv.innerHTML = rackHtml(d, { mode: 'preview', size: 'rack-compact' });
+    buzz(4);
+    return true;
+  }
+  const a = ds.action;
+  if (!a) return false;
+  if (a === 'new-place') {
+    const from = t.closest('[data-sheet="form"]') ? 'form' : t.closest('[data-sheet="place"]') ? 'place' : '';
+    openPlaceEditor(null, 'kuehlschrank', from);
+    return true;
+  }
+  if (a === 'place-save') { savePlace(); return true; }
+  if (a === 'place-delete') { deletePlace(); return true; }
+  if (a === 'open-placement') { openPlacement(ds.id); return true; }
+  if (a === 'toggle-rack' && state.draft) { state.draft.rackOpen = !state.draft.rackOpen; refreshFormSlots(); return true; }
+  if (a === 'auto-slots' || a === 'clear-slots') {
+    const inForm = !!t.closest('[data-sheet="form"]');
+    const target = inForm ? state.draft?.data : byId(state.placing);
+    const p = target && placeById(target.placeId);
+    if (!target || !p) return true;
+    target.slots = a === 'auto-slots' ? autoSlots(p, inForm ? state.draft.id : target.id, [], Math.max(1, toInt(target.qty) || 1)) : [];
+    buzz(6);
+    if (inForm) refreshFormSlots(); else updatePlacedWine(target);
+    return true;
+  }
+  if (a === 'slot-scan' && state.slotTarget) {
+    state.pendingSlot = { ...state.slotTarget, t: Date.now() };
+    closeSheet('slot');
+    openCamera('new');
+    return true;
+  }
+  return false;
+}
+
 function onClick(e) {
-  const t = e.target.closest('[data-action],[data-tab],[data-open],[data-filter],[data-color],[data-step],[data-star],[data-food],[data-loc],[data-search]');
+  const t = e.target.closest('[data-action],[data-tab],[data-open],[data-filter],[data-color],[data-step],[data-star],[data-food],[data-loc],[data-search],[data-view],[data-place],[data-pplace],[data-slottoggle],[data-slotfree],[data-slotwine],[data-editplace],[data-newplace],[data-kind],[data-pstep],[data-sweet],[data-dcount],[data-foodgo],[data-moveto]');
   if (!t) return;
   if (t.dataset.tab) { goTab(t.dataset.tab); return; }
   if (t.dataset.open) { openDetail(t.dataset.open); return; }
+  if (onStorageClick(t)) return;
   if (t.dataset.search) {
     // Tapping a grape or region in the detail view shows all wines that match it.
     state.query = t.dataset.search;
@@ -1383,10 +1967,15 @@ function onClick(e) {
     return;
   }
   if (t.dataset.color && state.draft) {
-    const c = state.draft.data.color === t.dataset.color ? '' : t.dataset.color;
-    state.draft.data.color = c;
+    const d = state.draft.data;
+    const c = d.color === t.dataset.color ? '' : t.dataset.color;
+    d.color = c;
     state.draft.touched.add('color');
     $$('[data-color]').forEach(b => b.setAttribute('aria-checked', String(b.dataset.color === c)));
+    if (d.sweetness && !sweetOptions(c).includes(d.sweetness)) d.sweetness = '';
+    const sf = $('#sweet-field');
+    if (sf) sf.innerHTML = sweetHtml(d);
+    refreshFormSlots();
     buzz(6);
     return;
   }
@@ -1398,6 +1987,13 @@ function onClick(e) {
     state.draft.data[key] = v;
     const out = $(`#s-${key}`);
     if (out) out.textContent = v;
+    if (key === 'qty') {
+      // More bottles get the next free slots, fewer bottles give slots back.
+      const d = state.draft.data;
+      const p = placeById(d.placeId);
+      if (hasGrid(p)) d.slots = v > (d.slots || []).length ? autoSlots(p, state.draft.id, d.slots, v) : (d.slots || []).slice(0, v);
+      refreshFormSlots();
+    }
     buzz(6);
     dupCheck();
     return;
@@ -1478,6 +2074,7 @@ function bind() {
   document.addEventListener('input', e => {
     const t = e.target;
     if (t.id === 'q') { state.query = t.value; renderList(); return; }
+    if (t.id === 'pl-name' && state.placeDraft) { state.placeDraft.name = t.value; state.placeDraft.nameTouched = true; return; }
     const key = t.dataset?.field;
     if (key && state.draft) {
       state.draft.touched.add(key);
@@ -1491,6 +2088,11 @@ function bind() {
     if (t.id === 'sort') { state.sort = t.value; renderList(); }
     if (t.id === 'effects') { saveSettings({ effects: t.checked }); if (t.checked) celebrate('small'); }
     if (t.id === 'model') saveSettings({ model: t.value });
+    if (t.id === 'more-types') {
+      saveSettings({ moreTypes: t.checked });
+      if (!t.checked && COLORS[state.filter]?.extra) state.filter = 'alle';
+      toast(t.checked ? 'Mehr Arten und Geschmacksrichtung sind an' : 'Nur noch die Grund-Arten');
+    }
   });
   document.addEventListener('submit', e => {
     if (e.target.id !== 'somm-bar') return;
@@ -1522,10 +2124,11 @@ function bind() {
 
 /* ---------- start ---------- */
 async function loadAll() {
-  const [wines, events, game] = await Promise.all([db.getAll('wines'), db.getAll('events'), db.getMeta('game', null)]);
+  const [wines, events, game, places] = await Promise.all([db.getAll('wines'), db.getAll('events'), db.getMeta('game', null), db.getMeta('places', [])]);
   state.wines = wines.sort(SORTERS.neu);
   state.events = events;
   state.game = { xp: 0, unlocked: {}, scans: 0, sommelier: 0, ...(game || {}) };
+  state.places = cleanPlaces(places);
 }
 
 async function boot() {

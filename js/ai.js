@@ -2,7 +2,7 @@
 // Swapping the provider later means changing only this file.
 
 import { norm, thisYear, sleep } from './util.js';
-import { COLORS, STATUS, status, normCountry, cleanTaste } from './wine.js';
+import { COLORS, STATUS, status, normCountry, cleanTaste, baseType, normSweet, cleanPairing, pairingOf } from './wine.js';
 
 const API = 'https://openrouter.ai/api/v1';
 // Free models with image input (checked 17 Nov 2026). OpenRouter tries them in this order.
@@ -119,10 +119,22 @@ export function colorOf(value) {
   return '';
 }
 
-const FIELD_NAMES = { winzer: 'producer', wein: 'name', rebsorte: 'grape', jahrgang: 'vintage', region: 'region', land: 'country', farbe: 'color', trinken_ab: 'drinkFrom', trinken_bis: 'drinkTo' };
+// With "Mehr Arten" on, the finer types are kept; otherwise they fall back to the basic ones.
+function typeOf(value, more) {
+  const s = norm(value);
+  let t = '';
+  if (/orange|maischevergoren|skin contact|amber/.test(s)) t = 'orange';
+  else if (/perl|frizzante|secco|pet nat|petillant|vino frizzante/.test(s)) t = 'perl';
+  else if (/likor|liqueur|port|sherry|madeira|marsala|fortified/.test(s)) t = 'likoer';
+  if (t) return more ? t : baseType(t);
+  return colorOf(value);
+}
+
+const FIELD_NAMES = { winzer: 'producer', wein: 'name', rebsorte: 'grape', jahrgang: 'vintage', region: 'region', land: 'country', farbe: 'color', trinken_ab: 'drinkFrom', trinken_bis: 'drinkTo', suesse_stufe: 'sweetness' };
 
 function normalizeLabel(raw, model) {
   if (!raw || raw.kein_etikett === true) throw new AiError('nolabel', 'Auf dem Foto ist kein Weinetikett zu erkennen.');
+  const more = !!settings().moreTypes;
   const vintage = year(raw.jahrgang, 1900, thisYear() + 1);
   let from = year(raw.trinken_ab, 1900, 2100);
   let to = year(raw.trinken_bis, 1900, 2100);
@@ -131,12 +143,14 @@ function normalizeLabel(raw, model) {
   if (from && to && to - from > 60) to = from + 60;
   const fields = {
     producer: str(raw.winzer), name: str(raw.wein), grape: str(raw.rebsorte), vintage,
-    region: str(raw.region), country: normCountry(str(raw.land)), color: colorOf(str(raw.farbe)),
+    region: str(raw.region), country: normCountry(str(raw.land)), color: typeOf(str(raw.farbe), more),
     drinkFrom: from, drinkTo: to,
     taste: cleanTaste(raw.geschmack && {
       body: raw.geschmack.koerper, tannin: raw.geschmack.tannin, sweet: raw.geschmack.suesse, acid: raw.geschmack.saeure,
     }),
+    pairing: cleanPairing(raw.passt_zu),
   };
+  if (more) fields.sweetness = normSweet(str(raw.suesse_stufe), fields.color);
   if (fields.name && norm(fields.name) === norm(fields.producer)) fields.name = '';
   if (!fields.producer && !fields.name && !fields.grape) {
     throw new AiError('nolabel', 'Die KI konnte auf dem Foto nichts lesen. Probier ein schärferes Foto.');
@@ -146,8 +160,8 @@ function normalizeLabel(raw, model) {
   return { fields, unsure, model };
 }
 
-const LABEL_PROMPT = `You read wine labels for a wine cellar app. Look at the photo and reply with ONLY one JSON object and no other text, in this shape:
-{"winzer": "...", "wein": "...", "rebsorte": "...", "jahrgang": 2021, "region": "...", "land": "...", "farbe": "...", "trinken_ab": 2023, "trinken_bis": 2030, "geschmack": {"koerper": 3, "tannin": 2, "suesse": 1, "saeure": 4}, "unsicher": ["..."]}
+const labelPrompt = more => `You read wine labels for a wine cellar app. Look at the photo and reply with ONLY one JSON object and no other text, in this shape:
+{"winzer": "...", "wein": "...", "rebsorte": "...", "jahrgang": 2021, "region": "...", "land": "...", "farbe": "...",${more ? ' "suesse_stufe": "...",' : ''} "trinken_ab": 2023, "trinken_bis": 2030, "geschmack": {"koerper": 3, "tannin": 2, "suesse": 1, "saeure": 4}, "passt_zu": ["...", "...", "..."], "unsicher": ["..."]}
 
 Rules:
 - winzer: the winery or producer, as printed on the label.
@@ -156,9 +170,11 @@ Rules:
 - jahrgang: the vintage as a 4-digit number; null if no vintage is visible. Never guess the vintage.
 - region: the wine region or appellation; null if unknown.
 - land: the country in German, e.g. "Österreich", "Italien", "Frankreich".
-- farbe: exactly one of "rot", "weiss", "rose", "schaum", "suess".
+- farbe: exactly one of ${more ? '"rot", "weiss", "rose", "orange" (orange or skin-contact wine), "schaum" (sparkling: Sekt, Champagne, Crémant, Cava), "perl" (semi-sparkling: Perlwein, Frizzante, Secco, Pét-Nat), "suess" (sweet dessert wine), "likoer" (fortified: Port, Sherry, Madeira)' : '"rot", "weiss", "rose", "schaum", "suess"'}.${more ? `
+- suesse_stufe: the sweetness as printed or typical for this wine. Still wines: "trocken", "halbtrocken", "lieblich" or "süß". Sparkling: "brut nature", "extra brut", "brut", "extra trocken", "trocken", "halbtrocken" or "mild". null if unknown.` : ''}
 - trinken_ab and trinken_bis: your best estimate of the drinking window, as years.
-- geschmack: your estimate of the typical taste of this wine from 1 (low) to 5 (high): koerper = body, tannin (null for white, rosé and sparkling wines), suesse = sweetness, saeure = acidity.
+- geschmack: your estimate of the taste of exactly this wine (style, quality level such as Federspiel or Smaragd, vintage) from 1 (low) to 5 (high): koerper = body, tannin (null for white, rosé and sparkling wines), suesse = sweetness, saeure = acidity.
+- passt_zu: three short German dish names that fit exactly this wine, e.g. "Wiener Schnitzel", "Forelle", "Spargel".
 - unsicher: the names of the fields you are unsure about.
 If the photo shows no wine label, reply {"kein_etikett": true}.`;
 
@@ -168,13 +184,14 @@ export async function readLabel(imageDataUrl) {
     return normalizeLabel({
       winzer: 'Weingut Musterhof', wein: 'Ried Sonnberg', rebsorte: 'Grüner Veltliner', jahrgang: 2021,
       region: 'Kamptal', land: 'Österreich', farbe: 'weiss', trinken_ab: 2023, trinken_bis: 2029, unsicher: ['trinken_bis'],
-      geschmack: { koerper: 3, tannin: null, suesse: 1, saeure: 4 },
+      geschmack: { koerper: 3, tannin: null, suesse: 1, saeure: 4 }, suesse_stufe: 'trocken',
+      passt_zu: ['Wiener Schnitzel', 'Spargel', 'Forelle'],
     }, 'demo/demo-modell');
   }
   const { content, model } = await chat([{
     role: 'user',
-    content: [{ type: 'text', text: LABEL_PROMPT }, { type: 'image_url', image_url: { url: imageDataUrl } }],
-  }], 600);
+    content: [{ type: 'text', text: labelPrompt(!!settings().moreTypes) }, { type: 'image_url', image_url: { url: imageDataUrl } }],
+  }], 750);
   return normalizeLabel(parseJson(content), model);
 }
 
@@ -185,12 +202,12 @@ export async function askSommelier(food, wines) {
     return { picks: list.slice(0, 2).map(w => ({ id: w.id, grund: 'Im Demo-Modus passt jeder Wein. Mit echter KI gibt es echte Gründe.' })), tipp: 'Leicht gekühlt servieren.' };
   }
   const refs = list.map((w, i) => ({ ref: `W${i + 1}`, w }));
-  const lines = refs.map(({ ref, w }) => [ref, w.producer || '-', w.name || '-', w.grape || '-', w.vintage || '-', COLORS[w.color]?.label || '-', STATUS[status(w)].label].join(' | ')).join('\n');
+  const lines = refs.map(({ ref, w }) => [ref, w.producer || '-', w.name || '-', w.grape || '-', w.vintage || '-', COLORS[w.color]?.label || '-', STATUS[status(w)].label, pairingOf(w).dishes.join(', ') || '-'].join(' | ')).join('\n');
   const prompt = `You are a warm, witty sommelier in a home wine cellar app. Answer in German and use the informal "du".
 The user is eating: "${String(food).slice(0, 200)}".
 Pick up to 3 wines from the user's cellar below that fit best. Prefer wines with the status "Bald trinken" or "Drüber" when they fit. Avoid "Lagern" unless nothing else fits.
 Reply with ONLY one JSON object: {"picks": [{"id": "W1", "grund": "one short sentence why it fits"}], "tipp": "one short serving tip"}
-Cellar (id | producer | wine | grape | vintage | type | status):
+Cellar (id | producer | wine | grape | vintage | type | status | fits with):
 ${lines}`;
   const { content } = await chat([{ role: 'user', content: prompt }], 500);
   const r = parseJson(content);

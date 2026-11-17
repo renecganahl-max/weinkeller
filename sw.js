@@ -1,5 +1,5 @@
 // Service worker: keeps the app usable offline. Network first, so updates show up at once.
-const CACHE = 'weinkeller-v2';
+const CACHE = 'weinkeller-v3';
 const SHELL = [
   './', 'index.html', 'css/app.css', 'manifest.json',
   'js/app.js', 'js/util.js', 'js/icons.js', 'js/db.js', 'js/image.js', 'js/wine.js', 'js/game.js', 'js/ai.js',

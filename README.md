@@ -47,7 +47,18 @@ andere Gratis-Bildmodelle. Der Schlüssel bleibt nur auf dem Gerät.
 - Fenster lassen sich nach unten wegwischen, Zahlen zählen hoch, Punkte fliegen aus dem Level-Abzeichen.
 - Keller: Suche, Filter, Sortierung, Anzahl, Lagerort, Preis, Notizen. Als Liste oder als Regal
   mit großen Flaschen (Umschalter neben der Suche). Farbbalken zeigt den Mix aus Rot, Weiß und Co.
-- Lagerort-Schnellwahl: die häufigsten Lagerorte als Knöpfe unter dem Feld.
+- Lager: Weinkühlschrank, Kellerregal, Weinregal (mit Plan aus Reihen und Plätzen) oder Kiste und
+  anderer Ort (ohne feste Plätze). Ansicht „Lager“ im Keller zeigt jede Flasche als Kreis an ihrem
+  Platz; die Suche lässt passende Flaschen aufleuchten. Leeres Fach antippen: Etikett scannen und die
+  Flasche liegt direkt dort. Beim Eintragen schlägt die App das zuletzt benutzte Lager und freie Plätze
+  vor. In der Detail-Ansicht zeigt „Wo liegt er?“ die Plätze; Umziehen in ein anderes Lager mit einem Tipp.
+- Flasche öffnen: Anzahl ab 1, höchstens der Bestand; geöffnete Flaschen geben ihren Platz frei.
+- Mehr Weinarten (Schalter unter „Mehr“): Orange, Perlwein, Likörwein und die Geschmacksrichtung
+  (trocken, halbtrocken, lieblich, süß; bei Sekt brut nature bis mild). Die KI liest das mit.
+- „Passt zu“: drei Gerichte pro Wein, beim Scannen von der KI, sonst typisch für die Rebsorte.
+  Antippen fragt den Sommelier.
+- Geschmack ohne KI berücksichtigt Begriffe wie Steinfeder, Federspiel, Smaragd, Reserve, Ried.
+- Ohne Lager gibt es weiter das einfache Feld „Lagerort“ mit Schnellwahl.
 - Geschmacksprofil in der Detail-Ansicht (leicht–kräftig, sanft–tanninreich, trocken–süß,
   mild–säurebetont): von der KI geschätzt oder typisch für die Rebsorte.
 - Rebsorte und Region in der Detail-Ansicht antippen: der Keller zeigt alle passenden Weine.
